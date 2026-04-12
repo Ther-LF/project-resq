@@ -482,10 +482,13 @@ class ActQuantWrapper(torch.nn.Module):
         """Pre-quantize weights for real integer GEMM inference.
 
         Splits weight along K dimension into precision groups matching
-        the activation quantizer's configuration, then quantizes each group.
+        the activation quantizer's configuration.
 
-        Weight quantization uses per-group symmetric quantization (groupsize=128)
-        to maintain reasonable accuracy with low-bit weights.
+        Weight quantization strategy:
+        - ALL weight groups use 8-bit per-group symmetric quantization
+        - This gives: INT4_act × INT8_weight (main) + INT8_act × INT8_weight (high)
+        - 4-bit weight quant is too lossy without GPTQ; 8-bit is sufficient
+        - This matches the existing mixed-precision GEMM kernel design
 
         After calling this, use forward_real_quant() instead of forward().
         """
@@ -500,7 +503,10 @@ class ActQuantWrapper(torch.nn.Module):
         low_dim = quantizer.low_bits_length
         high_dim_start = K - quantizer.high_bits_length
 
-        # Handle groupsize > 0 (e.g., o_proj with groupsize=64)
+        # Weight quantization groupsize (along K dim)
+        w_groupsize = 128
+
+        # Handle activation groupsize > 0 (e.g., o_proj with groupsize=64)
         if quantizer.groupsize > 0:
             N = W.shape[0]
             gs = quantizer.groupsize
@@ -516,22 +522,22 @@ class ActQuantWrapper(torch.nn.Module):
             W_h = W[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
             W_l = W[:, :low_dim] if quantizer.low_bits_length > 0 else None
 
-        # Quantize weights per-group (groupsize along K dim for better accuracy)
-        w_groupsize = 128  # per-group weight quantization for accuracy
+        # All weights quantized to 8-bit (per-group symmetric)
+        W_BITS = 8
 
-        q_m, s_m = self._quantize_weight_per_group(W_m, quantizer.bits, w_groupsize)
-        self.register_buffer('W_m_int', q_m)      # (N, K_m) int values as float
-        self.register_buffer('W_m_scale', s_m)     # (N, K_m // gs) per-group scales
+        q_m, s_m = self._quantize_weight_per_group(W_m, W_BITS, w_groupsize)
+        self.register_buffer('W_m_int', q_m)      # (N, K_m) centered ints as half
+        self.register_buffer('W_m_scale', s_m)     # (N, num_groups)
         self._w_groupsize_m = w_groupsize
 
         if W_h is not None:
-            q_h, s_h = self._quantize_weight_per_group(W_h, quantizer.high_bits, w_groupsize)
+            q_h, s_h = self._quantize_weight_per_group(W_h, W_BITS, w_groupsize)
             self.register_buffer('W_h_int', q_h)
             self.register_buffer('W_h_scale', s_h)
             self._w_groupsize_h = w_groupsize
 
         if W_l is not None:
-            q_l, s_l = self._quantize_weight_per_group(W_l, quantizer.low_bits, w_groupsize)
+            q_l, s_l = self._quantize_weight_per_group(W_l, W_BITS, w_groupsize)
             self.register_buffer('W_l_int', q_l)
             self.register_buffer('W_l_scale', s_l)
             self._w_groupsize_l = w_groupsize
