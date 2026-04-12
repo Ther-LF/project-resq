@@ -29,6 +29,37 @@ def get_minq_maxq(bits, sym):
     return minq, maxq
 
 
+def quantize_weight_per_channel(W, bits, sym=True):
+    """Per-output-channel weight quantization. Returns (q_int, scale, [zero]).
+
+    W: (N, K) weight tensor
+    Returns centered integer weights as fp16 and per-channel scale (N,1).
+    """
+    _, maxq = get_minq_maxq(bits, sym)
+    maxq = maxq.to(W.device)
+
+    if sym:
+        # Symmetric: scale = max(|W|) / maxq per channel
+        wmax = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+        scale = wmax / maxq
+        q = torch.clamp(torch.round(W / scale), -(maxq + 1), maxq)
+        # Return centered int as fp16 (for sym, already centered at 0)
+        return q, scale
+    else:
+        # Asymmetric: scale = (max - min) / maxq per channel
+        wmax = W.amax(dim=1, keepdim=True)
+        wmin = W.amin(dim=1, keepdim=True)
+        tmp = (wmin == 0) & (wmax == 0)
+        wmin[tmp] = -1
+        wmax[tmp] = 1
+        scale = (wmax - wmin) / maxq
+        zero = torch.round(-wmin / scale)
+        q = torch.clamp(torch.round(W / scale) + zero, 0, maxq)
+        # Return centered int as fp16: (q - zero)
+        q_centered = q - zero
+        return q_centered, scale
+
+
 def asym_quant(x, scale, zero, maxq):
     scale = scale.to(x.device)
     zero = zero.to(x.device)
@@ -446,6 +477,215 @@ class ActQuantWrapper(torch.nn.Module):
             self.out_quantizer.free()
 
         return x
+
+    def prepare_real_quant_weights(self):
+        """Pre-quantize weights for real quant inference.
+
+        Splits weight along K dimension into precision groups matching
+        the activation quantizer's configuration, then quantizes each group
+        to its target bit-width per output channel.
+
+        After calling this, use forward_real_quant() instead of forward().
+        """
+        W = self.module.weight.data  # (N, K)
+        K = W.shape[1]
+        quantizer = self.quantizer
+
+        if quantizer.bits >= 16:
+            # No activation quantization → no real quant needed
+            self._real_quant_ready = False
+            return
+
+        low_dim = quantizer.low_bits_length
+        high_dim_start = K - quantizer.high_bits_length
+
+        # Handle groupsize > 0 (e.g., o_proj with groupsize=64)
+        if quantizer.groupsize > 0:
+            N = W.shape[0]
+            gs = quantizer.groupsize
+            num_groups = K // gs
+            W_grouped = W.reshape(N, num_groups, gs)
+            high_dim_g = gs - quantizer.high_bits_length
+
+            W_m = W_grouped[:, :, low_dim:high_dim_g].reshape(N, -1)
+            W_h = W_grouped[:, :, high_dim_g:].reshape(N, -1) if quantizer.high_bits_length > 0 else None
+            W_l = W_grouped[:, :, :low_dim].reshape(N, -1) if quantizer.low_bits_length > 0 else None
+        else:
+            W_m = W[:, low_dim:high_dim_start]
+            W_h = W[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
+            W_l = W[:, :low_dim] if quantizer.low_bits_length > 0 else None
+
+        # Quantize each weight portion per output channel (symmetric)
+        q_m, s_m = quantize_weight_per_channel(W_m, quantizer.bits, sym=True)
+        self.register_buffer('W_m_int', q_m.half())
+        self.register_buffer('W_m_scale', s_m.half())
+
+        if W_h is not None:
+            q_h, s_h = quantize_weight_per_channel(W_h, quantizer.high_bits, sym=True)
+            self.register_buffer('W_h_int', q_h.half())
+            self.register_buffer('W_h_scale', s_h.half())
+
+        if W_l is not None:
+            q_l, s_l = quantize_weight_per_channel(W_l, quantizer.low_bits, sym=True)
+            self.register_buffer('W_l_int', q_l.half())
+            self.register_buffer('W_l_scale', s_l.half())
+
+        self._real_quant_ready = True
+
+    def _apply_rotation(self, x):
+        """Apply Hadamard rotation (extracted from forward for reuse)."""
+        x_dtype = x.dtype
+        if self.online_full_had:
+            if self.fp32_had:
+                x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
+            else:
+                x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+        elif self.online_partial_had:
+            if self.fp32_had:
+                x = x.float()
+            init_shape = x.shape
+            if self.K == 1:
+                x = (
+                    HadamardTransform.apply(
+                        x.reshape(-1, init_shape[-1] // self.had_dim, self.had_dim).transpose(1, 2)
+                    ) / math.sqrt(init_shape[-1] // self.had_dim)
+                ).transpose(1, 2)
+            else:
+                x = (
+                    self.had_K.to(x.dtype)
+                    @ x.reshape(-1, init_shape[-1] // self.had_dim, self.had_dim)
+                ) / math.sqrt(init_shape[-1] // self.had_dim)
+            if self.fp32_had:
+                x = x.to(x_dtype)
+            x = x.reshape(init_shape)
+        return x
+
+    def forward_real_quant(
+        self,
+        x,
+        R1=None,
+        R2=None,
+        transpose=False,
+        column_order=None,
+    ):
+        """Real quantization forward: integer quantize -> integer-equivalent matmul -> dequantize.
+
+        Instead of fake quant (quantize->dequantize->fp16 matmul), this does:
+        1. Hadamard rotation (same as fake quant)
+        2. Quantize activation to centered integers
+        3. Matmul with pre-quantized integer weights (fp16 exact for small ints)
+        4. Dequantize output using activation_scale * weight_scale
+        """
+        x_dtype = x.dtype
+
+        # 1. Rotation (identical to fake quant)
+        x = self._apply_rotation(x)
+
+        if self.quantizer.bits >= 16:
+            if R1 is not None:
+                return self.module(x, R1, R2, transpose).to(x_dtype)
+            else:
+                return self.module(x).to(x_dtype)
+
+        # 2. Compute per-token activation quantization parameters
+        self.quantizer.find_params(x)
+        quantizer = self.quantizer
+
+        # 3. Split activation and quantize to centered integers
+        if quantizer.groupsize > 0:
+            init_shape = x.shape  # (batch, seq, K)
+            x = x.reshape(x.shape[0], x.shape[1], x.shape[2] // quantizer.groupsize, quantizer.groupsize)
+
+        low_dim = quantizer.low_bits_length
+        high_dim = x.shape[-1] - quantizer.high_bits_length
+        x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
+
+        # Quantize main group → centered int as fp16
+        if quantizer.sym:
+            q_m = torch.clamp(torch.round(x_m / quantizer.scale), -(quantizer.maxq + 1), quantizer.maxq)
+            act_scale_m = quantizer.scale
+        else:
+            q_m = torch.clamp(torch.round(x_m / quantizer.scale) + quantizer.zero, 0, quantizer.maxq) - quantizer.zero
+            act_scale_m = quantizer.scale
+
+        # Quantize high precision group
+        q_h = act_scale_h = None
+        if quantizer.high_bits_length > 0:
+            if quantizer.sym:
+                q_h = torch.clamp(torch.round(x_h / quantizer.scale_h), -(quantizer.maxq_h + 1), quantizer.maxq_h)
+                act_scale_h = quantizer.scale_h
+            else:
+                q_h = torch.clamp(torch.round(x_h / quantizer.scale_h) + quantizer.zero_h, 0, quantizer.maxq_h) - quantizer.zero_h
+                act_scale_h = quantizer.scale_h
+
+        # Quantize low precision group
+        q_l = act_scale_l = None
+        if quantizer.low_bits_length > 0:
+            if quantizer.sym:
+                q_l = torch.clamp(torch.round(x_l / quantizer.scale_l), -(quantizer.maxq_l + 1), quantizer.maxq_l)
+                act_scale_l = quantizer.scale_l
+            else:
+                q_l = torch.clamp(torch.round(x_l / quantizer.scale_l) + quantizer.zero_l, 0, quantizer.maxq_l) - quantizer.zero_l
+                act_scale_l = quantizer.scale_l
+
+        self.quantizer.free()
+
+        # 4. Flatten for matmul
+        if quantizer.groupsize > 0:
+            batch_seq = init_shape[0] * init_shape[1]
+            q_m_flat = q_m.reshape(batch_seq, -1)
+            # For grouped per-token quant, scale is (batch, seq, num_groups, 1)
+            # All groups share same per-token scale → extract token-level scale
+            act_s_m = act_scale_m.reshape(batch_seq, -1)[:, :1]
+
+            if q_h is not None:
+                q_h_flat = q_h.reshape(batch_seq, -1)
+                act_s_h = act_scale_h.reshape(batch_seq, -1)[:, :1]
+            if q_l is not None:
+                q_l_flat = q_l.reshape(batch_seq, -1)
+                act_s_l = act_scale_l.reshape(batch_seq, -1)[:, :1]
+        else:
+            orig_shape = x_m.shape[:-1]  # everything except K dim
+            q_m_flat = q_m.reshape(-1, q_m.shape[-1])
+            act_s_m = act_scale_m.reshape(-1, act_scale_m.shape[-1])[:, :1]
+
+            if q_h is not None:
+                q_h_flat = q_h.reshape(-1, q_h.shape[-1])
+                act_s_h = act_scale_h.reshape(-1, act_scale_h.shape[-1])[:, :1]
+            if q_l is not None:
+                q_l_flat = q_l.reshape(-1, q_l.shape[-1])
+                act_s_l = act_scale_l.reshape(-1, act_scale_l.shape[-1])[:, :1]
+
+        # 5. Integer-equivalent matmul
+        # y = sum_i (act_scale_i * w_scale_i.T) * (q_act_i @ q_w_i.T)
+        N = self.W_m_int.shape[0]
+        y = (act_s_m * self.W_m_scale.T) * (q_m_flat.half() @ self.W_m_int.T)
+
+        if q_h is not None:
+            y = y + (act_s_h * self.W_h_scale.T) * (q_h_flat.half() @ self.W_h_int.T)
+
+        if q_l is not None:
+            y = y + (act_s_l * self.W_l_scale.T) * (q_l_flat.half() @ self.W_l_int.T)
+
+        # Bias
+        if self.module.bias is not None:
+            y = y + self.module.bias
+
+        # Reshape back
+        if quantizer.groupsize > 0:
+            y = y.reshape(init_shape[0], init_shape[1], N)
+        else:
+            y = y.reshape(*orig_shape, N)
+
+        y = y.to(x_dtype)
+
+        # 6. Output quantization (if needed)
+        if self.out_quantizer.bits < 16:
+            self.out_quantizer.find_params(y)
+            y = self.out_quantizer(y).to(x_dtype)
+            self.out_quantizer.free()
+
+        return y
 
     def get_rotated_weight(self, R1=None, R2=None, R4=None, transpose=False):
 

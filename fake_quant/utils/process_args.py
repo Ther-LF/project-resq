@@ -78,6 +78,12 @@ def parser_gen():
         default=False,
         help="Apply Hadamard rotation in FP32 (default: False)",
     )
+    parser.add_argument(
+        "--real_quant",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use real integer quantization instead of fake quant (quantize→int matmul→dequant)",
+    )
 
     # Activation Quantization Arguments
     parser.add_argument(

@@ -337,6 +337,20 @@ def train() -> None:
         if "basis_change" in name:
             m.weight.data.copy_(torch.eye(model.config.hidden_size))
     model = ptq_model(ptq_args, model, model_args)
+
+    # Enable real quant if requested: pre-quantize weights and swap forward methods
+    if getattr(ptq_args, 'real_quant', False):
+        from utils.quant_utils import ActQuantWrapper
+        log.info("Enabling real quantization mode...")
+        real_quant_count = 0
+        for name, m in model.named_modules():
+            if isinstance(m, ActQuantWrapper):
+                m.prepare_real_quant_weights()
+                if getattr(m, '_real_quant_ready', False):
+                    m.forward = m.forward_real_quant
+                    real_quant_count += 1
+        log.info(f"Real quant enabled for {real_quant_count} layers")
+
     print(model)
     model.seqlen = training_args.model_max_length
 
