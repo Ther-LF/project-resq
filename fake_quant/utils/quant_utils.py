@@ -479,11 +479,13 @@ class ActQuantWrapper(torch.nn.Module):
         return x
 
     def prepare_real_quant_weights(self):
-        """Pre-quantize weights for real quant inference.
+        """Pre-quantize weights for real integer GEMM inference.
 
         Splits weight along K dimension into precision groups matching
-        the activation quantizer's configuration, then quantizes each group
-        to its target bit-width per output channel.
+        the activation quantizer's configuration, then quantizes each group.
+
+        Weight quantization uses per-group symmetric quantization (groupsize=128)
+        to maintain reasonable accuracy with low-bit weights.
 
         After calling this, use forward_real_quant() instead of forward().
         """
@@ -492,7 +494,6 @@ class ActQuantWrapper(torch.nn.Module):
         quantizer = self.quantizer
 
         if quantizer.bits >= 16:
-            # No activation quantization → no real quant needed
             self._real_quant_ready = False
             return
 
@@ -515,22 +516,96 @@ class ActQuantWrapper(torch.nn.Module):
             W_h = W[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
             W_l = W[:, :low_dim] if quantizer.low_bits_length > 0 else None
 
-        # Quantize each weight portion per output channel (symmetric)
-        q_m, s_m = quantize_weight_per_channel(W_m, quantizer.bits, sym=True)
-        self.register_buffer('W_m_int', q_m.half())
-        self.register_buffer('W_m_scale', s_m.half())
+        # Quantize weights per-group (groupsize along K dim for better accuracy)
+        w_groupsize = 128  # per-group weight quantization for accuracy
+
+        q_m, s_m = self._quantize_weight_per_group(W_m, quantizer.bits, w_groupsize)
+        self.register_buffer('W_m_int', q_m)      # (N, K_m) int values as float
+        self.register_buffer('W_m_scale', s_m)     # (N, K_m // gs) per-group scales
+        self._w_groupsize_m = w_groupsize
 
         if W_h is not None:
-            q_h, s_h = quantize_weight_per_channel(W_h, quantizer.high_bits, sym=True)
-            self.register_buffer('W_h_int', q_h.half())
-            self.register_buffer('W_h_scale', s_h.half())
+            q_h, s_h = self._quantize_weight_per_group(W_h, quantizer.high_bits, w_groupsize)
+            self.register_buffer('W_h_int', q_h)
+            self.register_buffer('W_h_scale', s_h)
+            self._w_groupsize_h = w_groupsize
 
         if W_l is not None:
-            q_l, s_l = quantize_weight_per_channel(W_l, quantizer.low_bits, sym=True)
-            self.register_buffer('W_l_int', q_l.half())
-            self.register_buffer('W_l_scale', s_l.half())
+            q_l, s_l = self._quantize_weight_per_group(W_l, quantizer.low_bits, w_groupsize)
+            self.register_buffer('W_l_int', q_l)
+            self.register_buffer('W_l_scale', s_l)
+            self._w_groupsize_l = w_groupsize
 
         self._real_quant_ready = True
+
+    @staticmethod
+    def _quantize_weight_per_group(W, bits, groupsize):
+        """Per-group symmetric weight quantization along K dimension.
+
+        W: (N, K) weight tensor
+        Returns:
+            q: (N, K) centered integer values (as half for storage)
+            scale: (N, num_groups) per-group scales
+        """
+        N, K_orig = W.shape
+        _, maxq = get_minq_maxq(bits, sym=True)
+        maxq = maxq.to(W.device)
+
+        # Pad K to multiple of groupsize if needed
+        if K_orig % groupsize != 0:
+            pad = groupsize - K_orig % groupsize
+            W = torch.nn.functional.pad(W, (0, pad))
+        K = W.shape[1]
+        num_groups = K // groupsize
+
+        W_grouped = W.reshape(N, num_groups, groupsize)
+
+        # Per-group symmetric: scale = max(|W_group|) / maxq
+        wmax = W_grouped.abs().amax(dim=2, keepdim=True).clamp(min=1e-8)  # (N, ng, 1)
+        scale = wmax / maxq  # (N, ng, 1)
+
+        q = torch.clamp(torch.round(W_grouped / scale), -(maxq + 1), maxq)
+        q = q.reshape(N, K)[:, :K_orig]  # trim padding
+        scale = scale.squeeze(2)  # (N, num_groups)
+
+        return q.half(), scale.half()
+
+        self._real_quant_ready = True
+
+    @staticmethod
+    def _int_gemm_per_group(q_act, act_scale, W_int, W_scale, w_groupsize):
+        """Integer GEMM with per-group weight dequantization.
+
+        q_act: (M, K_part) centered integer activation (as fp16/float)
+        act_scale: (M, 1) per-token activation scale
+        W_int: (N, K_part) centered integer weight (as fp16)
+        W_scale: (N, num_groups) per-group weight scales
+        w_groupsize: weight quantization group size
+
+        Returns: (M, N) fp32 tensor = dequant(act) @ dequant(weight).T
+
+        Strategy: dequantize weight per-group first (cheap), then matmul.
+        This is mathematically equivalent to integer matmul + scale correction
+        but avoids overflow and is simple to implement.
+        Future: replace with actual integer GEMM kernel.
+        """
+        N, K = W_int.shape
+        num_groups = W_scale.shape[1]
+
+        # Dequantize weight: multiply each group by its scale
+        # W_scale: (N, ng) → (N, ng, 1), W_int reshaped: (N, ng, gs)
+        gs = w_groupsize
+        if K % gs != 0:
+            # Handle padding case: last group may be smaller
+            padded_K = num_groups * gs
+            W_padded = torch.nn.functional.pad(W_int.float(), (0, padded_K - K))
+            W_deq = (W_padded.reshape(N, num_groups, gs) * W_scale.float().unsqueeze(2)).reshape(N, padded_K)[:, :K]
+        else:
+            W_deq = (W_int.float().reshape(N, num_groups, gs) * W_scale.float().unsqueeze(2)).reshape(N, K)
+
+        # Matmul: (M, K) @ (N, K).T → (M, N), all in fp32
+        # act_scale is per-token: y = act_scale * q_act @ W_deq.T
+        return (act_scale.float() * q_act.float()) @ W_deq.T
 
     def _apply_rotation(self, x):
         """Apply Hadamard rotation (extracted from forward for reuse)."""
@@ -656,17 +731,28 @@ class ActQuantWrapper(torch.nn.Module):
                 q_l_flat = q_l.reshape(-1, q_l.shape[-1])
                 act_s_l = act_scale_l.reshape(-1, act_scale_l.shape[-1])[:, :1]
 
-        # 5. Integer-equivalent matmul
-        # Use fp32 throughout to avoid fp16 overflow (int8 values * K=256 can produce ~250k)
-        # y = sum_i (act_scale_i * w_scale_i.T) * (q_act_i @ q_w_i.T)
+        # 5. Integer-equivalent matmul with per-group weight dequantization
+        # For each precision group:
+        #   dequant(act) = act_scale * q_act_centered  (per-token scale)
+        #   dequant(weight) = w_scale_g * q_w_centered  (per-group scale)
+        #   y = dequant(act) @ dequant(weight).T
+        #     = act_scale * sum_g (q_act_g @ (w_scale_g * q_w_g).T)
+        # We dequant weights first (cheap) then do fp matmul with quantized activations
         N = self.W_m_int.shape[0]
-        y = (act_s_m.float() * self.W_m_scale.float().T) * (q_m_flat.float() @ self.W_m_int.float().T)
+
+        y = self._int_gemm_per_group(
+            q_m_flat, act_s_m, self.W_m_int, self.W_m_scale, self._w_groupsize_m
+        )
 
         if q_h is not None:
-            y = y + (act_s_h.float() * self.W_h_scale.float().T) * (q_h_flat.float() @ self.W_h_int.float().T)
+            y = y + self._int_gemm_per_group(
+                q_h_flat, act_s_h, self.W_h_int, self.W_h_scale, self._w_groupsize_h
+            )
 
         if q_l is not None:
-            y = y + (act_s_l.float() * self.W_l_scale.float().T) * (q_l_flat.float() @ self.W_l_int.float().T)
+            y = y + self._int_gemm_per_group(
+                q_l_flat, act_s_l, self.W_l_int, self.W_l_scale, self._w_groupsize_l
+            )
 
         y = y.half()
 
