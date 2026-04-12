@@ -657,16 +657,18 @@ class ActQuantWrapper(torch.nn.Module):
                 act_s_l = act_scale_l.reshape(-1, act_scale_l.shape[-1])[:, :1]
 
         # 5. Integer-equivalent matmul
-        # Use fp32 accumulation to avoid fp16 overflow (int values * K can exceed fp16 range)
+        # Use fp32 throughout to avoid fp16 overflow (int8 values * K=256 can produce ~250k)
         # y = sum_i (act_scale_i * w_scale_i.T) * (q_act_i @ q_w_i.T)
         N = self.W_m_int.shape[0]
-        y = (act_s_m * self.W_m_scale.T) * (q_m_flat.float() @ self.W_m_int.float().T).half()
+        y = (act_s_m.float() * self.W_m_scale.float().T) * (q_m_flat.float() @ self.W_m_int.float().T)
 
         if q_h is not None:
-            y = y + (act_s_h * self.W_h_scale.T) * (q_h_flat.float() @ self.W_h_int.float().T).half()
+            y = y + (act_s_h.float() * self.W_h_scale.float().T) * (q_h_flat.float() @ self.W_h_int.float().T)
 
         if q_l is not None:
-            y = y + (act_s_l * self.W_l_scale.T) * (q_l_flat.float() @ self.W_l_int.float().T).half()
+            y = y + (act_s_l.float() * self.W_l_scale.float().T) * (q_l_flat.float() @ self.W_l_int.float().T)
+
+        y = y.half()
 
         # Bias
         if self.module.bias is not None:
