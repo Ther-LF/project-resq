@@ -8,7 +8,7 @@
 ### k_groupsize, v_groupsize = 64 only for Llama-3.2-1B else 128
 #### Storing config for 70B model
 torchrun --nnodes=1 --nproc_per_node=1 --master_port=24544 ptq.py \
---input_model meta-llama/Llama-3.2-1B \
+--input_model unsloth/Llama-3.2-1B-Instruct \
 --per_device_eval_batch_size 1 \
 --model_max_length 2048 \
 --fp16 False \
