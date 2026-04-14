@@ -25,7 +25,7 @@ def get_wikitext2(
         if vision:
             tokenizer = transformers.AutoProcessor.from_pretrained(model)
         else:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=True)
 
     if eval_mode:
         testdata = datasets.load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")[
@@ -59,7 +59,7 @@ def get_c4(
         if vision:
             tokenizer = transformers.AutoProcessor.from_pretrained(model)
         else:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=True)
 
     if eval_mode:
         valdata = datasets.load_dataset(
@@ -111,7 +111,7 @@ def get_ptb(
         if vision:
             tokenizer = transformers.AutoProcessor.from_pretrained(model)
         else:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=True)
 
     if eval_mode:
         testdata = datasets.load_dataset("ptb_text_only", "penn_treebank", split="test")
@@ -140,7 +140,7 @@ def get_alpaca(
         if vision:
             tokenizer = transformers.AutoProcessor.from_pretrained(model)
         else:
-            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=True)
 
     if eval_mode:
         raise ValueError # no eval set for alpaca
