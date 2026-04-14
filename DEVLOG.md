@@ -54,3 +54,11 @@
 - **[2026-04-14 21:59:46]** [python] create `fake_quant/csrc/setup.py`
 - **[2026-04-14 22:07:13]** [cpp] edit `fake_quant/csrc/resq_gemm/resq_gemm_binding.cpp`
 - **[2026-04-14 22:14:54]** [python] create `fake_quant/bench_gemm.py`
+- **[2026-04-14 22:31:15]** [python] create `fake_quant/triton_gemm.py`
+- **[2026-04-14 22:31:42]** [python] edit `fake_quant/bench_gemm.py`
+- **[2026-04-14 22:32:12]** [python] edit `fake_quant/bench_gemm.py`
+- **[2026-04-14 22:32:29]** [python] edit `fake_quant/bench_gemm.py`
+- **[2026-04-14 22:33:50]** [python] edit `fake_quant/bench_gemm.py`
+- **[2026-04-14 22:34:22]** [python] edit `fake_quant/bench_gemm.py`
+- **[2026-04-14 22:40:06]** [test] create `fake_quant/test_triton_int.py`
+- **[2026-04-14 22:41:00]** [test] edit `fake_quant/test_triton_int.py`

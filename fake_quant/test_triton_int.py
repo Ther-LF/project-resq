@@ -28,7 +28,7 @@ def main():
     BLOCK = 32
     A = torch.randint(-8, 8, (BLOCK, BLOCK), dtype=torch.int8, device='cuda')
     B = torch.randint(-8, 8, (BLOCK, BLOCK), dtype=torch.int8, device='cuda')
-    C_ref = (A.int() @ B.int().T)
+    C_ref = (A.float() @ B.float().T).int()
 
     # Test 1: direct int8 dot
     C1 = torch.zeros(BLOCK, BLOCK, dtype=torch.int32, device='cuda')
