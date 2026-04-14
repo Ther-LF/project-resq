@@ -32,3 +32,5 @@
 - **[2026-04-14 20:39:15]** [python] edit `fake_quant/utils/quant_utils.py`
 - **[2026-04-14 20:39:47]** [python] edit `fake_quant/utils/quant_utils.py`
 - **[2026-04-14 20:40:08]** [python] edit `fake_quant/utils/quant_utils.py`
+- **[2026-04-14 20:52:55]** [python] edit `fake_quant/utils/quant_utils.py`
+- **[2026-04-14 20:53:14]** [python] edit `fake_quant/utils/quant_utils.py`

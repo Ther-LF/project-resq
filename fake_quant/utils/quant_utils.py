@@ -562,12 +562,6 @@ class ActQuantWrapper(torch.nn.Module):
             self.register_buffer('W_m_scale', scale_m)
             self._w_groupsize_m = W_m.shape[1]
 
-            # DEBUG: verify reconstruction
-            import logging
-            W_m_recon = (Q_m.float() * scale_m.float()).half()
-            diff = (W_m.float() - W_m_recon.float()).abs()
-            logging.warning(f"[DEBUG prepare] W_m recon: max_diff={diff.max().item():.6f}, Q_m range=[{Q_m.min().item()}, {Q_m.max().item()}], scale_m shape={scale_m.shape}")
-
             if W_h is not None and 'high' in w_quantizers:
                 scale_h = w_quantizers['high'].scale.to(W.device).half()
                 self.register_buffer('W_h_int', Q_h.half())
@@ -785,18 +779,6 @@ class ActQuantWrapper(torch.nn.Module):
         # Weight was quantized to 8-bit per-group and stored in interleaved layout
         W_deq = self._dequant_weight()
         M_flat = dq_x.reshape(-1, dq_x.shape[-1])  # (M, K)
-
-        # DEBUG: compare W_deq with original weight on first call
-        if not hasattr(self, '_debug_printed'):
-            W_orig = self.module.weight.data
-            diff = (W_deq.float().to(W_orig.device) - W_orig.float()).abs()
-            import logging
-            logging.warning(f"[DEBUG] W_deq vs W_orig: max_diff={diff.max().item():.6f}, mean_diff={diff.mean().item():.6f}, "
-                          f"W_deq shape={W_deq.shape}, W_orig shape={W_orig.shape}, "
-                          f"W_deq range=[{W_deq.min().item():.4f}, {W_deq.max().item():.4f}], "
-                          f"W_orig range=[{W_orig.min().item():.4f}, {W_orig.max().item():.4f}]")
-            self._debug_printed = True
-
         y = (M_flat.float() @ W_deq.float().T).half()  # fp32 matmul to avoid overflow
 
         # Bias
