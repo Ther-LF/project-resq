@@ -327,6 +327,15 @@ def parser_gen():
         default=False,
         help="Enable model parallelism using this flag. Map decoder blocks to different GPUs",
     )
+
+    # GEMM data collection arguments
+    parser.add_argument("--gemm_output_dir", type=str, default="./gemm_data",
+                        help="Directory to save collected GEMM data")
+    parser.add_argument("--gemm_batch_sizes", type=str, default="1,2,4",
+                        help="Comma-separated batch sizes to collect")
+    parser.add_argument("--gemm_num_batches", type=int, default=1,
+                        help="Number of batches to collect per batch size")
+
     args, unknown = parser.parse_known_args()
 
     assert (
