@@ -683,6 +683,10 @@ class ActQuantWrapper(torch.nn.Module):
         if quantizer.groupsize > 0:
             dq_x = dq_x.reshape(init_shape)  # (batch, seq, K)
 
+        # 4b. Apply column_order permutation (critical for o_proj/down_proj)
+        if column_order is not None:
+            dq_x = dq_x[..., column_order]
+
         # 5. Dequantize weight and matmul
         # Weight was quantized to 8-bit per-group and stored in interleaved layout
         W_deq = self._dequant_weight()

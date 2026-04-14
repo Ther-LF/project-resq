@@ -28,4 +28,4 @@ torchrun --nnodes=1 --nproc_per_node=1 --master_port=24544 ptq.py \
 --rotation_granularity 'full_shared' \
 --rotate \
 --real_quant \
---tasks "boolq" \
+--tasks "mmlu,boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa" \
