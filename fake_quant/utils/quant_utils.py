@@ -516,6 +516,12 @@ class ActQuantWrapper(torch.nn.Module):
         W_BITS_H = quantizer.high_bits if quantizer.high_bits_length > 0 else W_BITS_M
         W_BITS_L = quantizer.low_bits if quantizer.low_bits_length > 0 else W_BITS_M
 
+        # Use per-channel weight quantization (groupsize = K_group) to match GPTQ's
+        # per-channel scale. GPTQ uses perchannel=True, so using per-group with a
+        # different groupsize would introduce re-quantization error.
+        # Set w_groupsize to -1 to signal per-channel (handled below).
+        use_perchannel = (w_bits is not None)  # GPTQ was used → per-channel
+
         # Handle activation groupsize > 0 (e.g., o_proj with groupsize=64)
         if quantizer.groupsize > 0:
             N = W.shape[0]
@@ -532,24 +538,29 @@ class ActQuantWrapper(torch.nn.Module):
             W_h = W[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
             W_l = W[:, :low_dim] if quantizer.low_bits_length > 0 else None
 
-        q_m, s_m = self._quantize_weight_per_group(W_m, W_BITS_M, w_groupsize)
-        self.register_buffer('W_m_int', q_m)      # (N, K_m) centered ints as half
-        self.register_buffer('W_m_scale', s_m)     # (N, num_groups)
-        self._w_groupsize_m = w_groupsize
+        # When GPTQ was used (per-channel), set groupsize = K_group to match
+        gs_m = W_m.shape[1] if use_perchannel else w_groupsize
+        gs_h = W_h.shape[1] if (use_perchannel and W_h is not None) else w_groupsize
+        gs_l = W_l.shape[1] if (use_perchannel and W_l is not None) else w_groupsize
+
+        q_m, s_m = self._quantize_weight_per_group(W_m, W_BITS_M, gs_m)
+        self.register_buffer('W_m_int', q_m)
+        self.register_buffer('W_m_scale', s_m)
+        self._w_groupsize_m = gs_m
         self._w_bits_m = W_BITS_M
 
         if W_h is not None:
-            q_h, s_h = self._quantize_weight_per_group(W_h, W_BITS_H, w_groupsize)
+            q_h, s_h = self._quantize_weight_per_group(W_h, W_BITS_H, gs_h)
             self.register_buffer('W_h_int', q_h)
             self.register_buffer('W_h_scale', s_h)
-            self._w_groupsize_h = w_groupsize
+            self._w_groupsize_h = gs_h
             self._w_bits_h = W_BITS_H
 
         if W_l is not None:
-            q_l, s_l = self._quantize_weight_per_group(W_l, W_BITS_L, w_groupsize)
+            q_l, s_l = self._quantize_weight_per_group(W_l, W_BITS_L, gs_l)
             self.register_buffer('W_l_int', q_l)
             self.register_buffer('W_l_scale', s_l)
-            self._w_groupsize_l = w_groupsize
+            self._w_groupsize_l = gs_l
             self._w_bits_l = W_BITS_L
 
         self._real_quant_ready = True
