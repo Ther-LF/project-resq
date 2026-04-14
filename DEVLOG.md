@@ -53,3 +53,4 @@
 - **[2026-04-14 21:59:28]** [cpp] create `fake_quant/csrc/resq_gemm/resq_gemm_binding.cpp`
 - **[2026-04-14 21:59:46]** [python] create `fake_quant/csrc/setup.py`
 - **[2026-04-14 22:07:13]** [cpp] edit `fake_quant/csrc/resq_gemm/resq_gemm_binding.cpp`
+- **[2026-04-14 22:14:54]** [python] create `fake_quant/bench_gemm.py`
