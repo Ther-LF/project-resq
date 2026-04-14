@@ -342,14 +342,15 @@ def train() -> None:
     if getattr(ptq_args, 'real_quant', False):
         from utils.quant_utils import ActQuantWrapper
         log.info("Enabling real quantization mode...")
+        w_bits = ptq_args.w_bits if ptq_args.w_bits < 16 else None
         real_quant_count = 0
         for name, m in model.named_modules():
             if isinstance(m, ActQuantWrapper):
-                m.prepare_real_quant_weights()
+                m.prepare_real_quant_weights(w_bits=w_bits)
                 if getattr(m, '_real_quant_ready', False):
                     m.forward = m.forward_real_quant
                     real_quant_count += 1
-        log.info(f"Real quant enabled for {real_quant_count} layers")
+        log.info(f"Real quant enabled for {real_quant_count} layers (w_bits={w_bits})")
 
     print(model)
     model.seqlen = training_args.model_max_length

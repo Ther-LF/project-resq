@@ -478,17 +478,21 @@ class ActQuantWrapper(torch.nn.Module):
 
         return x
 
-    def prepare_real_quant_weights(self):
+    def prepare_real_quant_weights(self, w_bits=None):
         """Pre-quantize weights for real integer GEMM inference.
 
         Splits weight along K dimension into precision groups matching
         the activation quantizer's configuration.
 
-        Weight quantization strategy:
-        - ALL weight groups use 8-bit per-group symmetric quantization
-        - This gives: INT4_act × INT8_weight (main) + INT8_act × INT8_weight (high)
-        - 4-bit weight quant is too lossy without GPTQ; 8-bit is sufficient
-        - This matches the existing mixed-precision GEMM kernel design
+        Weight quantization strategy (matching ResQ paper):
+        - main group: w_bits (default 4 with GPTQ, or 8 without)
+        - high group: high_bits (8-bit)
+        - low group: low_bits (2-bit)
+        This gives: INT4_act × INT4_weight (main) + INT8_act × INT8_weight (high)
+
+        If GPTQ was used (w_bits < 16), the weights already contain GPTQ's
+        quantize→dequantize values. Re-quantizing at the same precision
+        introduces negligible additional error.
 
         After calling this, use forward_real_quant() instead of forward().
         """
@@ -506,6 +510,12 @@ class ActQuantWrapper(torch.nn.Module):
         # Weight quantization groupsize (along K dim)
         w_groupsize = 128
 
+        # Determine per-group weight precision (matching activation precision)
+        # main group: use w_bits if provided, else match activation bits
+        W_BITS_M = w_bits if w_bits is not None else quantizer.bits
+        W_BITS_H = quantizer.high_bits if quantizer.high_bits_length > 0 else W_BITS_M
+        W_BITS_L = quantizer.low_bits if quantizer.low_bits_length > 0 else W_BITS_M
+
         # Handle activation groupsize > 0 (e.g., o_proj with groupsize=64)
         if quantizer.groupsize > 0:
             N = W.shape[0]
@@ -522,25 +532,25 @@ class ActQuantWrapper(torch.nn.Module):
             W_h = W[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
             W_l = W[:, :low_dim] if quantizer.low_bits_length > 0 else None
 
-        # All weights quantized to 8-bit (per-group symmetric)
-        W_BITS = 8
-
-        q_m, s_m = self._quantize_weight_per_group(W_m, W_BITS, w_groupsize)
+        q_m, s_m = self._quantize_weight_per_group(W_m, W_BITS_M, w_groupsize)
         self.register_buffer('W_m_int', q_m)      # (N, K_m) centered ints as half
         self.register_buffer('W_m_scale', s_m)     # (N, num_groups)
         self._w_groupsize_m = w_groupsize
+        self._w_bits_m = W_BITS_M
 
         if W_h is not None:
-            q_h, s_h = self._quantize_weight_per_group(W_h, W_BITS, w_groupsize)
+            q_h, s_h = self._quantize_weight_per_group(W_h, W_BITS_H, w_groupsize)
             self.register_buffer('W_h_int', q_h)
             self.register_buffer('W_h_scale', s_h)
             self._w_groupsize_h = w_groupsize
+            self._w_bits_h = W_BITS_H
 
         if W_l is not None:
-            q_l, s_l = self._quantize_weight_per_group(W_l, W_BITS, w_groupsize)
+            q_l, s_l = self._quantize_weight_per_group(W_l, W_BITS_L, w_groupsize)
             self.register_buffer('W_l_int', q_l)
             self.register_buffer('W_l_scale', s_l)
             self._w_groupsize_l = w_groupsize
+            self._w_bits_l = W_BITS_L
 
         self._real_quant_ready = True
 
