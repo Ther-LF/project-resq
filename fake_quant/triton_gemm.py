@@ -1,31 +1,26 @@
 """Triton GEMM kernels for ResQ mixed-precision quantized inference.
 
-Provides scaled integer GEMM where activation has per-token or per-group scale
-and weight has per-channel scale. Dequantization happens inside the kernel's
-tiling loop, so we don't need to split into small GEMMs for grouped layers.
-
 Kernels:
-  1. _scaled_int_gemm_kernel - INT8 act × INT8 weight, per-group/per-token scale
-  2. _fp16_gemm_kernel       - FP16 baseline with Triton auto-tune
+  1. _scaled_int_gemm_kernel - INT8×INT8→INT32 with per-group/per-token act scale
+     Per-group: K dimension padded so each BLOCK_K tile falls within one group,
+     enabling INT8 tensor core for every tile (no fp32 dequant fallback).
+  2. _fp16_gemm_kernel - FP16 baseline
 
 High-level APIs:
-  - scaled_int_gemm()       - Scaled integer GEMM (int8 inputs)
-  - triton_fp16_gemm()      - FP16 × FP16 → FP32
-  - triton_dequant_gemm()   - Dequant-then-fp16 GEMM (for overflow groups)
-
-All INT kernels compute: y[m,n] = Σ_k scale_a[m, k//G] * scale_w[n] * q_a[m,k] * q_w[n,k]
-
-Usage:
-    from triton_gemm import scaled_int_gemm, triton_fp16_gemm, triton_dequant_gemm
+  - scaled_int_gemm()  - Padded INT8 GEMM (handles per-group padding automatically)
+  - triton_fp16_gemm() - FP16 × FP16 → FP32
 """
 
 import torch
 import triton
 import triton.language as tl
 
+# Alignment for per-group K padding (must be >= max BLOCK_K in autotune configs)
+_K_ALIGN = 64
+
 
 # ============================================================
-# 1. Scaled INT8 × INT8 GEMM with per-group activation scale
+# 1. Scaled INT8 × INT8 GEMM  (per-token and per-group)
 # ============================================================
 
 @triton.autotune(
@@ -52,29 +47,29 @@ def _scaled_int_gemm_kernel(
     stride_am, stride_ak,
     stride_bn, stride_bk,
     stride_cm, stride_cn,
-    stride_sa_m, stride_sa_g,   # scale_a: (M, num_groups) or (M, 1)
-    stride_sb_n,                # scale_b: (N,) or (N, 1)
+    stride_sa_m, stride_sa_g,
+    stride_sb_n,
     # Grouping
-    QUANT_GROUP_SIZE: tl.constexpr,  # -1 for per-token, >0 for per-group
+    QUANT_GROUP_SIZE: tl.constexpr,  # -1 for per-token, >0 for per-group (padded)
     # Tile sizes
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """Scaled integer GEMM: C[m,n] = Σ_k scale_a[m, k//G] * scale_b[n] * A[m,k] * B[n,k]
+    """INT8 × INT8 → INT32 GEMM with per-group or per-token activation scale.
 
-    A: (M, K) int8, row-major
-    B: (N, K) int8, row-major  (C = A @ B^T)
-    scale_a: (M, num_groups) float32, per-group activation scale
-    scale_b: (N,) float32, per-channel weight scale
-    C: (M, N) float32 output
+    A: (M, K) int8, B: (N, K) int8  →  C = A @ B^T
+    scale_a: (M, num_groups) or (M,) float32
+    scale_b: (N,) float32
 
-    Per-group mode: dequantizes per-element by looking up scale_a[m, k//G] for
-    each k, then does fp32 accumulation. Correct for any group_size vs BLOCK_K.
+    Per-group: QUANT_GROUP_SIZE > 0. K must be padded so that BLOCK_K divides
+    QUANT_GROUP_SIZE. Then each tile's k-range falls within one group, and we
+    can use INT8 tensor core dot + apply the group's scale as a scalar.
+
+    Per-token: QUANT_GROUP_SIZE == -1. Pure INT8 dot, scale applied at the end.
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    # Swizzle for better L2 cache hit
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -82,114 +77,116 @@ def _scaled_int_gemm_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Block offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    # Pointers for A and B tiles
     a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = B_ptr + offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk
 
-    # Load weight scale (per-channel, constant for this N-block)
     sb = tl.load(scale_b_ptr + offs_n * stride_sb_n, mask=offs_n < N, other=0.0)
 
-    # Main GEMM loop over K tiles
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k_start in range(0, K, BLOCK_K):
         k_offs = k_start + offs_k
-        # Load A tile (int8)
         a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (k_offs[None, :] < K), other=0)
-        # Load B tile (int8)
         b = tl.load(b_ptrs, mask=(offs_n[:, None] < N) & (k_offs[None, :] < K), other=0)
 
-        if QUANT_GROUP_SIZE > 0:
-            # Per-group scale: dequant A to fp32, then do fp32 matmul with B
-            # Each element a[m,k] gets scale_a[m, k // QUANT_GROUP_SIZE]
-            # Compute group index for each k in this tile
-            group_indices = k_offs // QUANT_GROUP_SIZE  # (BLOCK_K,)
-            # Load scales for all groups touched by this tile
-            # sa_tile[m, k] = scale_a[m, group_indices[k]]
-            sa_tile = tl.load(
-                scale_a_ptr + offs_m[:, None] * stride_sa_m + group_indices[None, :] * stride_sa_g,
-                mask=(offs_m[:, None] < M) & (k_offs[None, :] < K),
-                other=1.0,
-            )
-            # Dequant A: float = scale * int
-            a_f32 = sa_tile * a.to(tl.float32)  # (BLOCK_M, BLOCK_K)
-            b_f32 = b.to(tl.float32)             # (BLOCK_N, BLOCK_K)
-            # FP32 matmul for this tile
-            acc += tl.dot(a_f32, tl.trans(b_f32))
-        else:
-            # Per-token scale: pure integer dot, apply scale at the end
-            dot_int32 = tl.dot(a, tl.trans(b), out_dtype=tl.int32)
-            acc += dot_int32.to(tl.float32)
+        # INT8 tensor core: int8 × int8 → int32 (exact)
+        dot_int32 = tl.dot(a, tl.trans(b), out_dtype=tl.int32)
+        dot_f32 = dot_int32.to(tl.float32)
 
-        # Advance pointers
+        if QUANT_GROUP_SIZE > 0:
+            # Per-group: this tile is within one group (guaranteed by K padding)
+            group_idx = k_start // QUANT_GROUP_SIZE
+            sa = tl.load(scale_a_ptr + offs_m * stride_sa_m + group_idx * stride_sa_g,
+                         mask=offs_m < M, other=1.0)
+            acc += sa[:, None] * dot_f32
+        else:
+            acc += dot_f32
+
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
     if QUANT_GROUP_SIZE > 0:
-        # Weight scale applied after accumulation
         acc = acc * sb[None, :]
     else:
-        # Per-token: apply both act scale and weight scale
-        sa = tl.load(scale_a_ptr + offs_m * stride_sa_m,
-                     mask=offs_m < M, other=1.0)
+        sa = tl.load(scale_a_ptr + offs_m * stride_sa_m, mask=offs_m < M, other=1.0)
         acc = sa[:, None] * sb[None, :] * acc
 
-    # Store result
     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, acc, mask=mask)
 
 
+def _pad_groups(q, group_size):
+    """Pad K dimension so each group is a multiple of _K_ALIGN.
+
+    q: (rows, ngroups * group_k) or (rows, K)
+    Returns: (rows, ngroups * padded_gk), padded_gk
+    """
+    rows, K = q.shape
+    ngroups = K // group_size
+    padded_gk = ((group_size + _K_ALIGN - 1) // _K_ALIGN) * _K_ALIGN
+    if padded_gk == group_size:
+        return q, group_size  # no padding needed
+    # Reshape to (rows, ngroups, group_k), pad, flatten
+    q_3d = q.reshape(rows, ngroups, group_size)
+    pad_width = padded_gk - group_size
+    q_padded = torch.nn.functional.pad(q_3d, (0, pad_width), value=0)  # pad last dim
+    return q_padded.reshape(rows, ngroups * padded_gk), padded_gk
+
+
 def scaled_int_gemm(q_act, q_weight, scale_act, scale_weight, group_size=-1):
-    """Scaled integer GEMM: Y = dequant(q_act, scale_act) @ dequant(q_weight, scale_weight)^T
+    """Scaled integer GEMM with INT8 tensor core.
+
+    For per-group: automatically pads K so BLOCK_K tiles align with groups.
 
     Args:
-        q_act: (M, K) int8 quantized activation (centered integers)
-        q_weight: (N, K) int8 quantized weight (centered integers, stored as half->int8)
-        scale_act: (M, 1) for per-token, or (M, num_groups) for per-group
-        scale_weight: (N, 1) or (N,) per-channel weight scale
-        group_size: -1 for per-token, >0 for per-group (e.g., 64)
-
+        q_act:    (M, K) int8 centered activations
+        q_weight: (N, K) int8 centered weights
+        scale_act:    (M, 1)/(M,) per-token, or (M, num_groups) per-group
+        scale_weight: (N, 1)/(N,) per-channel
+        group_size:   -1 per-token, >0 per-group (original, before padding)
     Returns:
-        Y: (M, N) float32 output
+        (M, N) float32
     """
     assert q_act.dim() == 2 and q_weight.dim() == 2
     M, K = q_act.shape
     N = q_weight.shape[0]
     assert q_weight.shape[1] == K
 
-    # Ensure int8
     q_act = q_act.to(torch.int8).contiguous()
     q_weight = q_weight.to(torch.int8).contiguous()
 
-    # Prepare scales
     scale_act = scale_act.float().contiguous()
     scale_weight = scale_weight.float().flatten().contiguous()
     assert scale_weight.shape[0] == N
 
     if group_size > 0:
+        # Pad groups for BLOCK_K alignment
+        q_act, padded_gk = _pad_groups(q_act, group_size)
+        q_weight, _ = _pad_groups(q_weight, group_size)
+        K = q_act.shape[1]  # updated K after padding
+
         if scale_act.dim() == 1:
             scale_act = scale_act.unsqueeze(1)
         assert scale_act.shape[0] == M
         stride_sa_m = scale_act.stride(0)
         stride_sa_g = scale_act.stride(1) if scale_act.dim() > 1 else 0
+        qgs = padded_gk
     else:
         if scale_act.dim() == 2:
-            scale_act = scale_act[:, 0]  # per-token: just one value per row
+            scale_act = scale_act[:, 0]
         scale_act = scale_act.flatten().contiguous()
         assert scale_act.shape[0] == M
         stride_sa_m = 1
         stride_sa_g = 0
+        qgs = -1
 
-    # Output
     C = torch.empty((M, N), device=q_act.device, dtype=torch.float32)
 
-    # Grid
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
     )
@@ -203,9 +200,8 @@ def scaled_int_gemm(q_act, q_weight, scale_act, scale_weight, group_size=-1):
         C.stride(0), C.stride(1),
         stride_sa_m, stride_sa_g,
         scale_weight.stride(0),
-        QUANT_GROUP_SIZE=group_size if group_size > 0 else -1,
+        QUANT_GROUP_SIZE=qgs,
     )
-
     return C
 
 
@@ -268,10 +264,7 @@ def _fp16_gemm_kernel(
 
 
 def triton_fp16_gemm(A, B):
-    """Triton FP16 × FP16 → FP32 GEMM. C = A @ B^T.
-
-    A: (M, K) fp16, B: (N, K) fp16 -> C: (M, N) fp32
-    """
+    """Triton FP16 × FP16 → FP32 GEMM.  C = A @ B^T."""
     assert A.dim() == 2 and B.dim() == 2
     M, K = A.shape
     N = B.shape[0]
@@ -292,92 +285,3 @@ def triton_fp16_gemm(A, B):
         C.stride(0), C.stride(1),
     )
     return C
-
-
-# ============================================================
-# 3. Dequant-then-FP16 GEMM (for groups that overflow int8)
-# ============================================================
-
-def triton_dequant_gemm(q_act, q_weight, scale_act, scale_weight, zero_act=None, group_size=-1):
-    """Dequant activations/weights to fp16, then run Triton FP16 GEMM.
-
-    For groups where centered integer values overflow int8 (e.g., 8-bit unsigned
-    activation with large zero_point). Dequant: x_fp16 = (q_int - zero) * scale.
-
-    Args:
-        q_act: quantized activation integers (any int dtype or float)
-            Per-token: (M, K)
-            Per-group: (M, ngroups, group_k) or already (M, K_total)
-        q_weight: (N, K) weight integers (float16 or int)
-        scale_act: activation scale
-            Per-token: (M, 1) or (M,)
-            Per-group: (M, ngroups) or (M, ngroups, 1)
-        scale_weight: (N, 1) or (N,) per-channel weight scale
-        zero_act: activation zero point (same shape structure as q_act), or None
-        group_size: -1 for per-token, >0 for per-group
-
-    Returns:
-        Y: (M, N) float32 output
-    """
-    # Dequant activation: x = (q - zero) * scale
-    q_a = q_act.float()
-    if zero_act is not None:
-        q_a = q_a - zero_act.float()
-
-    s_a = scale_act.float()
-    s_w = scale_weight.float().flatten()
-
-    if group_size > 0:
-        # Per-group: q_a is (M, ngroups, group_k), scale is (M, ngroups, 1)
-        if q_a.dim() == 3:
-            M, ngroups, gk = q_a.shape
-            s_a_expanded = s_a.reshape(M, ngroups, 1) if s_a.dim() == 3 else s_a.unsqueeze(-1)
-            x_fp16 = (q_a * s_a_expanded).reshape(M, ngroups * gk).half()
-        else:
-            # Already flattened (M, K_total) — need scale per-element
-            M, K = q_a.shape
-            ngroups = s_a.shape[1] if s_a.dim() >= 2 else 1
-            gk = K // ngroups
-            q_a_3d = q_a.reshape(M, ngroups, gk)
-            s_a_3d = s_a.reshape(M, ngroups, 1)
-            x_fp16 = (q_a_3d * s_a_3d).reshape(M, K).half()
-    else:
-        # Per-token: scale is (M, 1) or (M,)
-        if s_a.dim() == 1:
-            s_a = s_a.unsqueeze(1)
-        x_fp16 = (q_a * s_a).reshape(-1, q_a.shape[-1]).half()
-
-    # Dequant weight: w = q_w * scale_w
-    w_fp16 = (q_weight.float() * s_w.unsqueeze(1)).half()
-
-    # Run Triton FP16 GEMM
-    M = x_fp16.shape[0]
-    return triton_fp16_gemm(x_fp16, w_fp16)
-
-
-# ============================================================
-# 4. High-level API for ResQ benchmark
-# ============================================================
-
-def resq_mixed_precision_gemm(
-    q_act_main, scale_act_main,
-    q_act_high, scale_act_high,
-    q_weight_main, scale_weight_main,
-    q_weight_high, scale_weight_high,
-    group_size=-1,
-):
-    """Full ResQ mixed-precision GEMM: main (4-bit via int8 dot) + high (8-bit via fp16 dequant).
-
-    Main group: values fit in int4 [-8,7], stored as int8, uses INT8 tensor core.
-    High group: centered values may overflow int8, dequant to fp16 then fp16 GEMM.
-    """
-    y = scaled_int_gemm(q_act_main, q_weight_main,
-                        scale_act_main, scale_weight_main, group_size)
-
-    if q_act_high is not None and q_weight_high is not None:
-        y_h = triton_dequant_gemm(q_act_high, q_weight_high,
-                                  scale_act_high, scale_weight_high,
-                                  group_size=group_size)
-        y = y + y_h
-
-    return y

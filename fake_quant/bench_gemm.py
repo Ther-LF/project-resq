@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 # Try to import Triton GEMM kernels
 try:
-    from triton_gemm import scaled_int_gemm, triton_fp16_gemm, triton_dequant_gemm
+    from triton_gemm import scaled_int_gemm, triton_fp16_gemm
     HAS_TRITON = True
     print("Triton GEMM kernels loaded successfully")
 except ImportError:
