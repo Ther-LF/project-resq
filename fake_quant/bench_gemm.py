@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 # Try to import Triton GEMM kernels
 try:
-    from triton_gemm import scaled_int_gemm, triton_fp16_gemm, resq_mixed_precision_gemm
+    from triton_gemm import scaled_int_gemm, triton_fp16_gemm, triton_dequant_gemm
     HAS_TRITON = True
     print("Triton GEMM kernels loaded successfully")
 except ImportError:
@@ -209,65 +209,65 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 def gemm_triton_scaled_int(act_quant_main, act_quant_high,
                            weight_int_main, weight_int_high,
                            group_size=-1):
-    """Triton scaled integer GEMM: handles per-token and per-group scale natively.
+    """Triton mixed-precision GEMM — all computation in Triton kernels.
 
-    Falls back to fp32 reference for groups whose centered values overflow int8.
+    Main group (4-bit, centered [-8,7]): Triton INT8 tensor core kernel.
+    High group (8-bit, may overflow int8): dequant to fp16, Triton FP16 kernel.
+    No fallback to PyTorch matmul.
     """
     q_w_m = weight_int_main['q_int'].cuda()
     s_w_m = weight_int_main['scale'].cuda()
 
     q_x_m, s_x_m, grouped = _center_and_flatten(act_quant_main)
 
-    def _can_use_int8(q_x, q_w):
-        """Check if centered values fit in int8 [-128, 127]."""
-        x_max = q_x.abs().max().item()
-        w_max = q_w.abs().max().item()
-        return x_max <= 127 and w_max <= 127
-
     if grouped:
-        # Per-group: q_x is (batch, seq, ngroups, group_k), flatten to (M, K_total)
         batch, seq, ngroups, group_k = q_x_m.shape
         M = batch * seq
         q_x_flat = q_x_m.reshape(M, ngroups * group_k)
-        # scale: (M, ngroups)
         s_x_flat = s_x_m.reshape(M, ngroups)
         gs = group_k
     else:
         M = q_x_m.shape[0]
         q_x_flat = q_x_m
-        s_x_flat = s_x_m  # (M, 1)
+        s_x_flat = s_x_m
         gs = -1
 
-    if _can_use_int8(q_x_flat, q_w_m):
-        y = scaled_int_gemm(q_x_flat.to(torch.int8), q_w_m.to(torch.int8),
-                            s_x_flat, s_w_m, group_size=gs)
-    else:
-        # Fallback: dequant + fp16 matmul via reference path
-        y = gemm_real_quant(act_quant_main, None, weight_int_main, None)
-        y = y.float().reshape(-1, y.shape[-1])  # flatten to (M, N)
+    # Main group: INT8 Triton kernel (4-bit values always fit int8)
+    y = scaled_int_gemm(q_x_flat.to(torch.int8), q_w_m.to(torch.int8),
+                        s_x_flat, s_w_m, group_size=gs)
 
-    # High group
+    # High group: dequant to fp16, then Triton FP16 kernel
     if act_quant_high is not None and weight_int_high is not None:
         q_w_h = weight_int_high['q_int'].cuda()
         s_w_h = weight_int_high['scale'].cuda()
-        q_x_h, s_x_h, grouped_h = _center_and_flatten(act_quant_high)
+
+        # Get raw quant data (before centering) for proper dequant
+        q_h_raw = act_quant_high['q_int'].cuda().float()
+        s_h = act_quant_high['scale'].cuda().float()
+        z_h = act_quant_high.get('zero', None)
+        if z_h is not None:
+            z_h = z_h.cuda().float()
+
+        grouped_h = (s_h.dim() > 3)
 
         if grouped_h:
-            group_k_h = q_x_h.shape[-1]
-            q_x_h_flat = q_x_h.reshape(M, -1)
-            s_x_h_flat = s_x_h.reshape(M, ngroups)
+            # (batch, seq, ngroups, group_k_h)
+            b, sq, ng, gk_h = q_h_raw.shape
+            q_centered = q_h_raw - z_h if z_h is not None else q_h_raw
+            # s_h shape: (batch, seq, ngroups, 1)
+            x_h_fp16 = (q_centered * s_h).reshape(M, ng * gk_h).half()
         else:
-            q_x_h_flat = q_x_h
-            s_x_h_flat = s_x_h
+            # Per-token: (batch, seq, K_h)
+            q_centered = q_h_raw - z_h if z_h is not None else q_h_raw
+            # s_h may be (batch, seq, K_h) with same value — take [:,:,:1]
+            s_h_tok = s_h[..., :1] if s_h.dim() == 3 else s_h
+            x_h_fp16 = (q_centered * s_h_tok).reshape(M, -1).half()
 
-        if _can_use_int8(q_x_h_flat, q_w_h):
-            y_h = scaled_int_gemm(q_x_h_flat.to(torch.int8), q_w_h.to(torch.int8),
-                                  s_x_h_flat, s_w_h, group_size=gs)
-        else:
-            # High group overflows int8 — use fp32 reference
-            y_h = gemm_real_quant(act_quant_high, None, weight_int_high, None)
-            y_h = y_h.float().reshape(-1, y_h.shape[-1])  # flatten to (M, N)
+        # Dequant weight: w_fp16 = q_w * scale_w
+        w_h_fp16 = (q_w_h.float() * s_w_h.float().flatten().unsqueeze(1)).half()
 
+        # Triton FP16 GEMM for high group
+        y_h = triton_fp16_gemm(x_h_fp16, w_h_fp16)
         y = y + y_h
 
     if grouped:

@@ -5,21 +5,18 @@ and weight has per-channel scale. Dequantization happens inside the kernel's
 tiling loop, so we don't need to split into small GEMMs for grouped layers.
 
 Kernels:
-  1. matmul_s8s8s32_scaled  - INT8 act × INT8 weight, per-group act scale + per-channel weight scale
-  2. matmul_s4s4s32_scaled  - INT4 (packed) act × INT4 weight, same scale support
-  3. matmul_f16f16f32       - FP16 baseline with Triton auto-tune
+  1. _scaled_int_gemm_kernel - INT8 act × INT8 weight, per-group/per-token scale
+  2. _fp16_gemm_kernel       - FP16 baseline with Triton auto-tune
 
-All kernels compute: y[m,n] = Σ_k scale_a[m, k//G] * scale_w[n] * q_a[m,k] * q_w[n,k]
-which is mathematically equivalent to: Y = diag(S_a_per_group) @ Q_a @ Q_w^T @ diag(S_w)
+High-level APIs:
+  - scaled_int_gemm()       - Scaled integer GEMM (int8 inputs)
+  - triton_fp16_gemm()      - FP16 × FP16 → FP32
+  - triton_dequant_gemm()   - Dequant-then-fp16 GEMM (for overflow groups)
+
+All INT kernels compute: y[m,n] = Σ_k scale_a[m, k//G] * scale_w[n] * q_a[m,k] * q_w[n,k]
 
 Usage:
-    from triton_gemm import scaled_int_gemm, triton_fp16_gemm
-
-    # INT8 with per-group act scale (e.g., o_proj with groupsize=64)
-    y = scaled_int_gemm(q_act_int8, q_weight_int8, scale_act, scale_weight, group_size=64)
-
-    # INT8 with per-token act scale (e.g., q_proj, groupsize=-1)
-    y = scaled_int_gemm(q_act_int8, q_weight_int8, scale_act, scale_weight, group_size=-1)
+    from triton_gemm import scaled_int_gemm, triton_fp16_gemm, triton_dequant_gemm
 """
 
 import torch
@@ -298,7 +295,68 @@ def triton_fp16_gemm(A, B):
 
 
 # ============================================================
-# 3. High-level API for ResQ benchmark
+# 3. Dequant-then-FP16 GEMM (for groups that overflow int8)
+# ============================================================
+
+def triton_dequant_gemm(q_act, q_weight, scale_act, scale_weight, zero_act=None, group_size=-1):
+    """Dequant activations/weights to fp16, then run Triton FP16 GEMM.
+
+    For groups where centered integer values overflow int8 (e.g., 8-bit unsigned
+    activation with large zero_point). Dequant: x_fp16 = (q_int - zero) * scale.
+
+    Args:
+        q_act: quantized activation integers (any int dtype or float)
+            Per-token: (M, K)
+            Per-group: (M, ngroups, group_k) or already (M, K_total)
+        q_weight: (N, K) weight integers (float16 or int)
+        scale_act: activation scale
+            Per-token: (M, 1) or (M,)
+            Per-group: (M, ngroups) or (M, ngroups, 1)
+        scale_weight: (N, 1) or (N,) per-channel weight scale
+        zero_act: activation zero point (same shape structure as q_act), or None
+        group_size: -1 for per-token, >0 for per-group
+
+    Returns:
+        Y: (M, N) float32 output
+    """
+    # Dequant activation: x = (q - zero) * scale
+    q_a = q_act.float()
+    if zero_act is not None:
+        q_a = q_a - zero_act.float()
+
+    s_a = scale_act.float()
+    s_w = scale_weight.float().flatten()
+
+    if group_size > 0:
+        # Per-group: q_a is (M, ngroups, group_k), scale is (M, ngroups, 1)
+        if q_a.dim() == 3:
+            M, ngroups, gk = q_a.shape
+            s_a_expanded = s_a.reshape(M, ngroups, 1) if s_a.dim() == 3 else s_a.unsqueeze(-1)
+            x_fp16 = (q_a * s_a_expanded).reshape(M, ngroups * gk).half()
+        else:
+            # Already flattened (M, K_total) — need scale per-element
+            M, K = q_a.shape
+            ngroups = s_a.shape[1] if s_a.dim() >= 2 else 1
+            gk = K // ngroups
+            q_a_3d = q_a.reshape(M, ngroups, gk)
+            s_a_3d = s_a.reshape(M, ngroups, 1)
+            x_fp16 = (q_a_3d * s_a_3d).reshape(M, K).half()
+    else:
+        # Per-token: scale is (M, 1) or (M,)
+        if s_a.dim() == 1:
+            s_a = s_a.unsqueeze(1)
+        x_fp16 = (q_a * s_a).reshape(-1, q_a.shape[-1]).half()
+
+    # Dequant weight: w = q_w * scale_w
+    w_fp16 = (q_weight.float() * s_w.unsqueeze(1)).half()
+
+    # Run Triton FP16 GEMM
+    M = x_fp16.shape[0]
+    return triton_fp16_gemm(x_fp16, w_fp16)
+
+
+# ============================================================
+# 4. High-level API for ResQ benchmark
 # ============================================================
 
 def resq_mixed_precision_gemm(
@@ -308,20 +366,18 @@ def resq_mixed_precision_gemm(
     q_weight_high, scale_weight_high,
     group_size=-1,
 ):
-    """Full ResQ mixed-precision GEMM: main (4-bit) + high (8-bit).
+    """Full ResQ mixed-precision GEMM: main (4-bit via int8 dot) + high (8-bit via fp16 dequant).
 
-    Y = scaled_gemm(q_act_main, q_w_main, s_a_main, s_w_main)
-      + scaled_gemm(q_act_high, q_w_high, s_a_high, s_w_high)
-
-    For per-group (o_proj): group_size=64, scale_act has shape (M, num_groups)
-    For per-token (q_proj): group_size=-1, scale_act has shape (M, 1) or (M,)
+    Main group: values fit in int4 [-8,7], stored as int8, uses INT8 tensor core.
+    High group: centered values may overflow int8, dequant to fp16 then fp16 GEMM.
     """
     y = scaled_int_gemm(q_act_main, q_weight_main,
                         scale_act_main, scale_weight_main, group_size)
 
     if q_act_high is not None and q_weight_high is not None:
-        y_h = scaled_int_gemm(q_act_high, q_weight_high,
-                              scale_act_high, scale_weight_high, group_size)
+        y_h = triton_dequant_gemm(q_act_high, q_weight_high,
+                                  scale_act_high, scale_weight_high,
+                                  group_size=group_size)
         y = y + y_h
 
     return y
