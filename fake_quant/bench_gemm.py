@@ -57,13 +57,19 @@ def compute_perf_metrics(func, args, M, N, K, warmup=10, repeat=100):
     """Compute performance metrics for a GEMM function."""
     # Warmup
     for _ in range(warmup):
-        func(*args)
+        if args:
+            func(*args)
+        else:
+            func()
     torch.cuda.synchronize()
 
     # Timed runs
     start = time.perf_counter()
     for _ in range(repeat):
-        func(*args)
+        if args:
+            func(*args)
+        else:
+            func()
     torch.cuda.synchronize()
     elapsed = (time.perf_counter() - start) / repeat
 
@@ -82,7 +88,12 @@ def compute_perf_metrics(func, args, M, N, K, warmup=10, repeat=100):
 # ============================================================
 
 def gemm_fp16_baseline(x_fp16, W_fp16):
-    """Test 1: FP16 matmul, no quantization."""
+    """Test 1: FP16 matmul, no quantization.
+    x_fp16 may have groupsize shape (batch, seq, ngroups, gs) — reshape to (M, K)."""
+    if x_fp16.dim() > 3:
+        # Grouped: reshape from (batch, seq, ngroups, gs) -> (batch, seq, K)
+        batch, seq = x_fp16.shape[0], x_fp16.shape[1]
+        x_fp16 = x_fp16.reshape(batch, seq, -1)
     x_flat = x_fp16.reshape(-1, x_fp16.shape[-1])
     return (x_flat @ W_fp16.T).reshape(*x_fp16.shape[:-1], -1)
 
@@ -93,110 +104,149 @@ def gemm_fake_quant(output_fake):
 
 
 def _split_and_dequant_activation(act_quant_main, act_quant_high=None):
-    """Helper: dequantize activation integers back to fp16 (fake quant equivalent)."""
-    q_m = act_quant_main['q_int'].cuda()
-    s_m = act_quant_main['scale'].cuda()
-    z_m = act_quant_main.get('zero', None)
-    if z_m is not None:
-        z_m = z_m.cuda()
-        dq_m = s_m * (q_m.float() - z_m.float())
-    else:
-        dq_m = s_m * q_m.float()
+    """Helper: dequantize activation integers back to fp16 (fake quant equivalent).
+    Handles both per-token and per-group scales. Returns flat (M, K) tensors."""
+    q_m, s_m = _center_activation(act_quant_main)
+    # dequant: scale * centered_q
+    dq_m = (s_m * q_m).half()
+    # Flatten group dims if present: (batch, seq, ngroups, gs) -> (batch, seq, ngroups*gs)
+    if dq_m.dim() > 3:
+        batch, seq = dq_m.shape[0], dq_m.shape[1]
+        dq_m = dq_m.reshape(batch, seq, -1)
 
     dq_h = None
     if act_quant_high is not None:
-        q_h = act_quant_high['q_int'].cuda()
-        s_h = act_quant_high['scale'].cuda()
-        z_h = act_quant_high.get('zero', None)
-        if z_h is not None:
-            z_h = z_h.cuda()
-            dq_h = s_h * (q_h.float() - z_h.float())
-        else:
-            dq_h = s_h * q_h.float()
+        q_h, s_h = _center_activation(act_quant_high)
+        dq_h = (s_h * q_h).half()
+        if dq_h.dim() > 3:
+            batch, seq = dq_h.shape[0], dq_h.shape[1]
+            dq_h = dq_h.reshape(batch, seq, -1)
 
     return dq_m, dq_h
 
 
+def _center_activation(act_quant):
+    """Center activation integers: return (q_centered, scale) on cuda."""
+    q = act_quant['q_int'].cuda().float()
+    s = act_quant['scale'].cuda().float()
+    z = act_quant.get('zero', None)
+    if z is not None:
+        z = z.cuda().float()
+        q = q - z
+    return q, s
+
+
+def _is_grouped(act_quant):
+    """Check if activation has per-group scale (dim > 3 means grouped)."""
+    return act_quant['scale'].dim() > 3
+
+
+def _do_matmul(q_x, q_w, accumulate_dtype):
+    """Single matmul with specified accumulation dtype."""
+    if accumulate_dtype == torch.int32:
+        # Use torch._int_mm for INT8 GEMM with INT32 accumulation (PyTorch 2.3+)
+        # Requires int8 inputs and 2D tensors
+        q_x_i8 = q_x.to(torch.int8)
+        q_w_i8 = q_w.to(torch.int8)
+        return torch._int_mm(q_x_i8, q_w_i8.T).float()
+    else:  # fp32
+        return q_x.float() @ q_w.float().T
+
+
 def gemm_real_quant(act_quant_main, act_quant_high,
                     weight_int_main, weight_int_high,
-                    accumulate_dtype=torch.float32):
+                    accumulate_dtype=torch.float32, metadata=None):
     """Tests 3/4/5: Real quant GEMM with configurable accumulation.
+
+    Handles two cases:
+    - Per-token scale (groupsize=-1): single matmul, scale outside
+    - Per-group scale (groupsize>0, e.g. o_proj): per-group small GEMMs
 
     accumulate_dtype:
         torch.float32 -> Test 3 (fp32 accum)
         torch.float16 -> Test 4 (fp16 accum)
         torch.int32   -> Test 5 (int32 accum)
     """
-    # Activation: get centered integers and scales
-    q_x_m = act_quant_main['q_int'].cuda()  # int16
-    s_x_m = act_quant_main['scale'].cuda()
-    z_x_m = act_quant_main.get('zero', None)
-    if z_x_m is not None:
-        z_x_m = z_x_m.cuda()
-        q_x_m_centered = q_x_m.float() - z_x_m.float()
-    else:
-        q_x_m_centered = q_x_m.float()
+    q_w_m = weight_int_main['q_int'].cuda()  # (N, K_m), centered ints as half
+    s_w_m = weight_int_main['scale'].cuda()   # (N, 1) per-channel
 
-    # Weight: get integers and scale
-    q_w_m = weight_int_main['q_int'].cuda()  # half (centered ints)
-    s_w_m = weight_int_main['scale'].cuda()
-
-    # Main group matmul
-    init_shape = q_x_m_centered.shape
-    q_x_flat = q_x_m_centered.reshape(-1, q_x_m_centered.shape[-1])
-
-    if accumulate_dtype == torch.int32:
-        y_m_int = q_x_flat.int() @ q_w_m.int().T
-        y_m = y_m_int.float()
-    elif accumulate_dtype == torch.float16:
-        y_m = q_x_flat.half() @ q_w_m.half().T
-        y_m = y_m.float()
-    else:  # fp32
-        y_m = q_x_flat.float() @ q_w_m.float().T
-
-    # Apply scales: per-token s_x (M,1) * per-channel s_w (1,N)
-    # s_x shape varies: could be (batch, seq, 1) or (batch, seq, ngroups, 1)
-    # For simplicity, reshape s_x to (M, 1)
-    s_x_m_flat = s_x_m.reshape(-1, s_x_m.shape[-1])  # (M, 1) or similar
-    # Handle case where s_x has more dims (groupsize)
-    if s_x_m_flat.shape[-1] != 1:
-        # Per-group scale — average or broadcast. For benchmark, just use mean.
-        s_x_m_flat = s_x_m_flat.mean(dim=-1, keepdim=True)
-    y_m = s_x_m_flat * s_w_m.flatten().unsqueeze(0) * y_m
-
-    # High group (if exists)
-    y_h = torch.zeros_like(y_m)
-    if act_quant_high is not None and weight_int_high is not None:
-        q_x_h = act_quant_high['q_int'].cuda()
-        s_x_h = act_quant_high['scale'].cuda()
-        z_x_h = act_quant_high.get('zero', None)
-        if z_x_h is not None:
-            z_x_h = z_x_h.cuda()
-            q_x_h_centered = q_x_h.float() - z_x_h.float()
-        else:
-            q_x_h_centered = q_x_h.float()
-
+    q_w_h = None
+    s_w_h = None
+    if weight_int_high is not None:
         q_w_h = weight_int_high['q_int'].cuda()
         s_w_h = weight_int_high['scale'].cuda()
 
-        q_x_h_flat = q_x_h_centered.reshape(-1, q_x_h_centered.shape[-1])
+    grouped = _is_grouped(act_quant_main)
 
-        if accumulate_dtype == torch.int32:
-            y_h_int = q_x_h_flat.int() @ q_w_h.int().T
-            y_h = y_h_int.float()
-        elif accumulate_dtype == torch.float16:
-            y_h = q_x_h_flat.half() @ q_w_h.half().T
-            y_h = y_h.float()
-        else:
-            y_h = q_x_h_flat.float() @ q_w_h.float().T
+    if not grouped:
+        # === Per-token scale: single matmul ===
+        q_x_m, s_x_m = _center_activation(act_quant_main)
+        # s_x_m: (batch, seq, 1) or (batch*seq, 1)
+        init_shape = q_x_m.shape
+        q_x_flat = q_x_m.reshape(-1, q_x_m.shape[-1])  # (M, K_m)
+        s_x_flat = s_x_m.reshape(-1, s_x_m.shape[-1])   # (M, 1)
 
-        s_x_h_flat = s_x_h.reshape(-1, s_x_h.shape[-1])
-        if s_x_h_flat.shape[-1] != 1:
-            s_x_h_flat = s_x_h_flat.mean(dim=-1, keepdim=True)
-        y_h = s_x_h_flat * s_w_h.flatten().unsqueeze(0) * y_h
+        y_m = _do_matmul(q_x_flat, q_w_m, accumulate_dtype)  # (M, N)
+        y_m = s_x_flat * s_w_m.flatten().unsqueeze(0) * y_m
 
-    y = (y_m + y_h).half()
-    return y.reshape(*init_shape[:-1], -1)
+        # High group
+        y_h = torch.zeros_like(y_m)
+        if act_quant_high is not None and q_w_h is not None:
+            q_x_h, s_x_h = _center_activation(act_quant_high)
+            q_x_h_flat = q_x_h.reshape(-1, q_x_h.shape[-1])
+            s_x_h_flat = s_x_h.reshape(-1, s_x_h.shape[-1])
+
+            y_h = _do_matmul(q_x_h_flat, q_w_h, accumulate_dtype)
+            y_h = s_x_h_flat * s_w_h.flatten().unsqueeze(0) * y_h
+
+        y = (y_m + y_h).half()
+        return y.reshape(*init_shape[:-1], -1)
+
+    else:
+        # === Per-group scale: 32 small GEMMs ===
+        # act shape: (batch, seq, ngroups, group_k_m)
+        q_x_m, s_x_m = _center_activation(act_quant_main)
+        # q_x_m: (batch, seq, ngroups, group_k_m), s_x_m: (batch, seq, ngroups, 1)
+        batch, seq, ngroups, group_k_m = q_x_m.shape
+        N = q_w_m.shape[0]
+
+        # Weight is contiguous: (N, K_m_total) where K_m_total = ngroups * group_k_m
+        # Split weight into per-group chunks along K
+        # GPTQ layout: [main_cols(K_m_total) | high_cols(K_h_total)]
+        # Each group's main cols are contiguous within the main portion
+        q_w_m_grouped = q_w_m.reshape(N, ngroups, group_k_m)  # (N, ngroups, group_k_m)
+
+        # Per-group GEMMs
+        M = batch * seq
+        q_x_m_flat = q_x_m.reshape(M, ngroups, group_k_m)  # (M, ngroups, group_k_m)
+        s_x_m_flat = s_x_m.reshape(M, ngroups, 1)            # (M, ngroups, 1)
+
+        y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
+        for g in range(ngroups):
+            q_x_g = q_x_m_flat[:, g, :]    # (M, group_k_m)
+            q_w_g = q_w_m_grouped[:, g, :]  # (N, group_k_m)
+            s_x_g = s_x_m_flat[:, g, :]     # (M, 1)
+
+            y_g = _do_matmul(q_x_g, q_w_g, accumulate_dtype)  # (M, N)
+            y += s_x_g * s_w_m.flatten().unsqueeze(0) * y_g
+
+        # High group (same logic)
+        if act_quant_high is not None and q_w_h is not None:
+            q_x_h, s_x_h = _center_activation(act_quant_high)
+            group_k_h = q_x_h.shape[-1]
+            q_x_h_flat = q_x_h.reshape(M, ngroups, group_k_h)
+            s_x_h_flat = s_x_h.reshape(M, ngroups, 1)
+            q_w_h_grouped = q_w_h.reshape(N, ngroups, group_k_h)
+
+            for g in range(ngroups):
+                q_x_g = q_x_h_flat[:, g, :]
+                q_w_g = q_w_h_grouped[:, g, :]
+                s_x_g = s_x_h_flat[:, g, :]
+
+                y_g = _do_matmul(q_x_g, q_w_g, accumulate_dtype)
+                y += s_x_g * s_w_h.flatten().unsqueeze(0) * y_g
+
+        return y.half().reshape(batch, seq, N)
 
 
 def gemm_custom_kernel(data, kernel_path=None):
@@ -212,8 +262,7 @@ ALL_TESTS = [
     ('FP16 baseline', 'fp16'),
     ('Fake quant', 'fake'),
     ('Real (fp32 acc)', 'real_fp32'),
-    ('Real (fp16 acc)', 'real_fp16'),
-    ('Real (int32 acc)', 'real_int32'),
+    ('Real (int8 GEMM)', 'real_int32'),
     ('Custom kernel', 'custom'),
 ]
 
@@ -270,7 +319,11 @@ def bench_single_layer(layer_dir, bs_key):
     W_fp16 = data['weight_fp16'].cuda()
     meta = data.get('metadata', {})
     N, K = W_fp16.shape
-    M = x_fp16.reshape(-1, x_fp16.shape[-1]).shape[0]
+    # For grouped inputs (batch, seq, ngroups, gs), M = batch * seq
+    if x_fp16.dim() > 3:
+        M = x_fp16.shape[0] * x_fp16.shape[1]
+    else:
+        M = x_fp16.reshape(-1, x_fp16.shape[-1]).shape[0]
 
     results = {}
 
@@ -299,10 +352,9 @@ def bench_single_layer(layer_dir, bs_key):
                 else:
                     perf = compute_perf_metrics(gemm_fp16_baseline, (x_fp16, W_fp16), M, N, K)
 
-            elif test_key in ('real_fp32', 'real_fp16', 'real_int32'):
+            elif test_key in ('real_fp32', 'real_int32'):
                 acc_dtype = {
                     'real_fp32': torch.float32,
-                    'real_fp16': torch.float16,
                     'real_int32': torch.int32,
                 }[test_key]
 
@@ -316,11 +368,11 @@ def bench_single_layer(layer_dir, bs_key):
                     results[test_name] = result
                     continue
 
-                y = gemm_real_quant(act_main, act_high, w_main, w_high, acc_dtype)
+                y = gemm_real_quant(act_main, act_high, w_main, w_high, acc_dtype, meta)
 
-                perf = compute_perf_metrics(
-                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high, acc_dtype),
-                    (), M, N, K, warmup=5, repeat=20)
+                def _perf_fn(am=act_main, ah=act_high, wm=w_main, wh=w_high, dt=acc_dtype, mt=meta):
+                    return gemm_real_quant(am, ah, wm, wh, dt, mt)
+                perf = compute_perf_metrics(_perf_fn, (), M, N, K, warmup=5, repeat=20)
 
             elif test_key == 'custom':
                 y = gemm_custom_kernel(data)
