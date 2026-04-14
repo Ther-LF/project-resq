@@ -16,15 +16,22 @@ import time
 import torch
 import torch.nn.functional as F
 
-# Try to import CUTLASS GEMM extension
+# Try to import Triton GEMM kernels
+try:
+    from triton_gemm import scaled_int_gemm, triton_fp16_gemm, resq_mixed_precision_gemm
+    HAS_TRITON = True
+    print("Triton GEMM kernels loaded successfully")
+except ImportError:
+    HAS_TRITON = False
+    print("WARNING: triton_gemm not found. Triton tests will be skipped.")
+
+# Try to import CUTLASS GEMM extension (optional)
 try:
     import resq_gemm
     HAS_CUTLASS = True
     print("CUTLASS GEMM extension loaded successfully")
 except ImportError:
     HAS_CUTLASS = False
-    print("WARNING: resq_gemm not found. CUTLASS tests will be skipped.")
-    print("  Build with: cd csrc && python setup.py install")
 
 
 # ============================================================
@@ -237,6 +244,66 @@ def gemm_real_quant(act_quant_main, act_quant_high,
         return y.half().reshape(batch, seq, N)
 
 
+def gemm_triton_scaled_int(act_quant_main, act_quant_high,
+                           weight_int_main, weight_int_high,
+                           group_size=-1):
+    """Triton scaled integer GEMM: handles per-token and per-group scale natively."""
+    q_w_m = weight_int_main['q_int'].cuda()
+    s_w_m = weight_int_main['scale'].cuda()
+
+    q_x_m, s_x_m, grouped = _center_and_flatten(act_quant_main)
+
+    if grouped:
+        # Per-group: q_x is (batch, seq, ngroups, group_k), flatten to (M, K_total)
+        batch, seq, ngroups, group_k = q_x_m.shape
+        M = batch * seq
+        q_x_flat = q_x_m.reshape(M, ngroups * group_k)
+        # scale: (M, ngroups)
+        s_x_flat = s_x_m.reshape(M, ngroups)
+        gs = group_k
+    else:
+        M = q_x_m.shape[0]
+        q_x_flat = q_x_m
+        s_x_flat = s_x_m  # (M, 1)
+        gs = -1
+
+    y = scaled_int_gemm(q_x_flat.to(torch.int8), q_w_m.to(torch.int8),
+                        s_x_flat, s_w_m, group_size=gs)
+
+    # High group
+    if act_quant_high is not None and weight_int_high is not None:
+        q_w_h = weight_int_high['q_int'].cuda()
+        s_w_h = weight_int_high['scale'].cuda()
+        q_x_h, s_x_h, grouped_h = _center_and_flatten(act_quant_high)
+
+        if grouped_h:
+            group_k_h = q_x_h.shape[-1]
+            q_x_h_flat = q_x_h.reshape(M, -1)
+            s_x_h_flat = s_x_h.reshape(M, ngroups)
+        else:
+            q_x_h_flat = q_x_h
+            s_x_h_flat = s_x_h
+
+        y_h = scaled_int_gemm(q_x_h_flat.to(torch.int8), q_w_h.to(torch.int8),
+                              s_x_h_flat, s_w_h, group_size=gs)
+        y = y + y_h
+
+    if grouped:
+        return y.half().reshape(batch, seq, -1)
+    return y.half()
+
+
+def gemm_triton_fp16(x_fp16, W_fp16):
+    """Triton FP16 × FP16 -> FP32 GEMM."""
+    if x_fp16.dim() > 3:
+        batch, seq = x_fp16.shape[0], x_fp16.shape[1]
+        x_fp16 = x_fp16.reshape(batch, seq, -1)
+    x_flat = x_fp16.reshape(-1, x_fp16.shape[-1]).contiguous()
+    W = W_fp16.contiguous()
+    y = triton_fp16_gemm(x_flat.half(), W.half())
+    return y.half().reshape(*x_fp16.shape[:-1], -1)
+
+
 def gemm_cutlass_fp16(x_fp16, W_fp16):
     """CUTLASS FP16 x FP16 -> FP32 GEMM."""
     if x_fp16.dim() > 3:
@@ -244,7 +311,7 @@ def gemm_cutlass_fp16(x_fp16, W_fp16):
         x_fp16 = x_fp16.reshape(batch, seq, -1)
     x_flat = x_fp16.reshape(-1, x_fp16.shape[-1]).contiguous()
     W = W_fp16.contiguous()
-    y = resq_gemm.gemm_f16f16f32(x_flat.half(), W.half())  # returns fp32
+    y = resq_gemm.gemm_f16f16f32(x_flat.half(), W.half())
     return y.half().reshape(*x_fp16.shape[:-1], -1)
 
 
@@ -256,7 +323,9 @@ ALL_TESTS = [
     ('FP16 baseline', 'fp16'),
     ('Fake quant', 'fake'),
     ('Real (fp32 acc)', 'real_fp32'),
-    ('CUTLASS INT GEMM', 'cutlass_int'),
+    ('Triton INT GEMM', 'triton_int'),
+    ('Triton FP16', 'triton_fp16'),
+    ('CUTLASS INT8', 'cutlass_int'),
     ('CUTLASS FP16', 'cutlass_fp16'),
 ]
 
@@ -360,6 +429,31 @@ def bench_single_layer(layer_dir, bs_key):
                     lambda: gemm_real_quant(act_main, act_high, w_main, w_high,
                                            use_cutlass=False),
                     M, N, K, warmup=5, repeat=20)
+
+            elif test_key == 'triton_int':
+                if not HAS_TRITON:
+                    result['error'] = 'triton_gemm not available'
+                    results[test_name] = result
+                    continue
+                if act_main is None or w_main is None:
+                    result['error'] = 'missing quant data'
+                    results[test_name] = result
+                    continue
+
+                y = gemm_triton_scaled_int(act_main, act_high, w_main, w_high)
+                perf = compute_perf_metrics(
+                    lambda: gemm_triton_scaled_int(act_main, act_high, w_main, w_high),
+                    M, N, K, warmup=5, repeat=20)
+
+            elif test_key == 'triton_fp16':
+                if not HAS_TRITON:
+                    result['error'] = 'triton_gemm not available'
+                    results[test_name] = result
+                    continue
+
+                y = gemm_triton_fp16(x_fp16, W_fp16)
+                perf = compute_perf_metrics(
+                    lambda: gemm_triton_fp16(x_fp16, W_fp16), M, N, K)
 
             elif test_key == 'cutlass_int':
                 if not HAS_CUTLASS:
