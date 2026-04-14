@@ -145,6 +145,16 @@ def benchmark_per_linear(layer, device, seq_len=128, warmup=3, repeats=15):
 def main():
     dev = torch.device('cuda:0')
 
+    # Init distributed (required by rotation_utils barriers)
+    import os
+    os.environ.setdefault('MASTER_ADDR', 'localhost')
+    os.environ.setdefault('MASTER_PORT', '29599')
+    os.environ.setdefault('RANK', '0')
+    os.environ.setdefault('WORLD_SIZE', '1')
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        dist.init_process_group(backend='nccl', world_size=1, rank=0)
+
     print("=" * 70)
     print("  ResQ Fake Quant vs Real Quant Latency Benchmark")
     print("  Model: Llama-3.2-1B-Instruct | GPU: H20 | dtype: fp16")
