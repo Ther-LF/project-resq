@@ -244,7 +244,7 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
     else:
         # Fallback: dequant + fp16 matmul via reference path
         y = gemm_real_quant(act_quant_main, None, weight_int_main, None)
-        y = y.float()
+        y = y.float().reshape(-1, y.shape[-1])  # flatten to (M, N)
 
     # High group
     if act_quant_high is not None and weight_int_high is not None:
@@ -266,7 +266,7 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
         else:
             # High group overflows int8 — use fp32 reference
             y_h = gemm_real_quant(act_quant_high, None, weight_int_high, None)
-            y_h = y_h.float()
+            y_h = y_h.float().reshape(-1, y_h.shape[-1])  # flatten to (M, N)
 
         y = y + y_h
 
