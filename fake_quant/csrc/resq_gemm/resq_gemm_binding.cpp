@@ -14,6 +14,7 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cutlass/numeric_types.h>
 
 // Forward declarations of kernel launchers (defined in resq_gemm.cu)

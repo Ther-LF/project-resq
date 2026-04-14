@@ -49,3 +49,7 @@
 - **[2026-04-14 21:44:30]** [python] edit `fake_quant/bench_gemm.py`
 - **[2026-04-14 21:44:59]** [python] edit `fake_quant/bench_gemm.py`
 - **[2026-04-14 21:45:12]** [python] edit `fake_quant/bench_gemm.py`
+- **[2026-04-14 21:58:52]** [cuda] create `fake_quant/csrc/resq_gemm/resq_gemm.cu`
+- **[2026-04-14 21:59:28]** [cpp] create `fake_quant/csrc/resq_gemm/resq_gemm_binding.cpp`
+- **[2026-04-14 21:59:46]** [python] create `fake_quant/csrc/setup.py`
+- **[2026-04-14 22:07:13]** [cpp] edit `fake_quant/csrc/resq_gemm/resq_gemm_binding.cpp`
