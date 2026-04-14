@@ -65,9 +65,10 @@ def ptq_model(args, model, model_args=None):
                 seqlen=2048,
                 eval_mode=False,
             )
-            quantizers = gptq_utils.gptq_fwrd(model, trainloader, "cuda", args)
+            quantizers, int_weights = gptq_utils.gptq_fwrd(model, trainloader, "cuda", args)
             # quantizers = gptq_utils.lwc_fwrd(model, trainloader, "cuda", args)
             save_dict["w_quantizers"] = quantizers
+            save_dict["w_int_weights"] = int_weights
         else:  # RTN Weight Quantization
             quantizers = gptq_utils.rtn_fwrd(model, "cuda", args)
             save_dict["w_quantizers"] = quantizers

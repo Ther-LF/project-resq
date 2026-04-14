@@ -478,7 +478,7 @@ class ActQuantWrapper(torch.nn.Module):
 
         return x
 
-    def prepare_real_quant_weights(self, w_bits=None, w_quantizers=None):
+    def prepare_real_quant_weights(self, w_bits=None, w_quantizers=None, w_int_weights=None):
         """Pre-quantize weights for real integer GEMM inference.
 
         Splits weight along K dimension into precision groups matching
@@ -489,9 +489,10 @@ class ActQuantWrapper(torch.nn.Module):
         - high group: high_bits (8-bit)
         - low group: low_bits (2-bit)
 
-        If w_quantizers dict is provided (from GPTQ checkpoint), uses the
-        exact GPTQ scale/zero for re-quantization to avoid any granularity
-        mismatch.
+        If w_int_weights tensor is provided (directly saved integers from GPTQ),
+        uses them directly for zero-error integer weights.
+        If only w_quantizers dict is provided (from GPTQ checkpoint), uses the
+        exact GPTQ scale/zero for re-quantization.
 
         After calling this, use forward_real_quant() instead of forward().
         """
@@ -522,13 +523,52 @@ class ActQuantWrapper(torch.nn.Module):
             W_m = W_grouped[:, :, low_dim:high_dim_g].reshape(N, -1)
             W_h = W_grouped[:, :, high_dim_g:].reshape(N, -1) if quantizer.high_bits_length > 0 else None
             W_l = W_grouped[:, :, :low_dim].reshape(N, -1) if quantizer.low_bits_length > 0 else None
+
+            # Also split integer weights if provided
+            if w_int_weights is not None:
+                Q_int = w_int_weights.to(W.device)
+                Q_grouped = Q_int.reshape(N, num_groups, gs)
+                Q_m = Q_grouped[:, :, low_dim:high_dim_g].reshape(N, -1)
+                Q_h = Q_grouped[:, :, high_dim_g:].reshape(N, -1) if quantizer.high_bits_length > 0 else None
+                Q_l = Q_grouped[:, :, :low_dim].reshape(N, -1) if quantizer.low_bits_length > 0 else None
+            else:
+                Q_m, Q_h, Q_l = None, None, None
         else:
             W_m = W[:, low_dim:high_dim_start]
             W_h = W[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
             W_l = W[:, :low_dim] if quantizer.low_bits_length > 0 else None
 
-        # If GPTQ quantizers available, use their scale for exact re-quantization
-        if w_quantizers is not None:
+            # Also split integer weights if provided
+            if w_int_weights is not None:
+                Q_int = w_int_weights.to(W.device)
+                Q_m = Q_int[:, low_dim:high_dim_start]
+                Q_h = Q_int[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
+                Q_l = Q_int[:, :low_dim] if quantizer.low_bits_length > 0 else None
+            else:
+                Q_m, Q_h, Q_l = None, None, None
+
+        # Priority: direct int weights > GPTQ re-quantization > RTN fallback
+        if w_int_weights is not None and w_quantizers is not None:
+            # Best path: use direct integers from GPTQ + scale from quantizer
+            scale_m = w_quantizers['main'].scale.to(W.device).half()
+            self.register_buffer('W_m_int', Q_m.half())
+            self.register_buffer('W_m_scale', scale_m)
+            self._w_groupsize_m = W_m.shape[1]
+
+            if W_h is not None and 'high' in w_quantizers:
+                scale_h = w_quantizers['high'].scale.to(W.device).half()
+                self.register_buffer('W_h_int', Q_h.half())
+                self.register_buffer('W_h_scale', scale_h)
+                self._w_groupsize_h = W_h.shape[1]
+
+            if W_l is not None and 'low' in w_quantizers:
+                scale_l = w_quantizers['low'].scale.to(W.device).half()
+                self.register_buffer('W_l_int', Q_l.half())
+                self.register_buffer('W_l_scale', scale_l)
+                self._w_groupsize_l = W_l.shape[1]
+
+        elif w_quantizers is not None:
+            # Fallback: re-quantize using GPTQ's scale (方案A, slight fp16 rounding error)
             q_m, s_m = self._requant_with_gptq_scale(W_m, w_quantizers['main'])
             self.register_buffer('W_m_int', q_m)
             self.register_buffer('W_m_scale', s_m)
@@ -932,6 +972,25 @@ class WeightQuantizer(torch.nn.Module):
                 x_dtype
             )
         return x
+
+    def quantize_to_int(self, x):
+        """Return the raw integer values (NOT dequantized) and the scale/zero used.
+
+        Returns:
+            q_int: integer tensor (same shape as x), dtype int16 or int8
+            scale: per-channel scale used
+            zero: per-channel zero point used (0 for symmetric)
+        """
+        if self.ready() and self.bits < 16:
+            scale = self.scale.to(x.device)
+            if self.sym:
+                q = torch.clamp(torch.round(x / scale), -(self.maxq + 1), self.maxq)
+                return q.to(torch.int16), scale, torch.zeros_like(scale)
+            else:
+                zero = self.zero.to(x.device)
+                q = torch.clamp(torch.round(x / scale) + zero, 0, self.maxq)
+                return q.to(torch.int16), scale, zero
+        return None, None, None
 
     def enabled(self):
         return self.maxq > 0

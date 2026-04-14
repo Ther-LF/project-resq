@@ -344,14 +344,18 @@ def train() -> None:
         log.info("Enabling real quantization mode...")
         w_bits = ptq_args.w_bits if ptq_args.w_bits < 16 else None
 
-        # Load GPTQ quantizers if available (from saved checkpoint)
+        # Load GPTQ quantizers and integer weights if available (from saved checkpoint)
         gptq_quantizers = None
+        gptq_int_weights = None
         if ptq_args.load_qmodel_path and w_bits is not None:
             import os
             qmodel = torch.load(ptq_args.load_qmodel_path, map_location='cpu')
             if 'w_quantizers' in qmodel:
                 gptq_quantizers = qmodel['w_quantizers']
                 log.info(f"Loaded {len(gptq_quantizers)} GPTQ quantizers from checkpoint")
+            if 'w_int_weights' in qmodel:
+                gptq_int_weights = qmodel['w_int_weights']
+                log.info(f"Loaded {len(gptq_int_weights)} integer weight tensors from checkpoint")
             del qmodel
 
         real_quant_count = 0
@@ -359,6 +363,7 @@ def train() -> None:
             if isinstance(m, ActQuantWrapper):
                 # Build per-layer quantizer dict for this wrapper
                 wq_dict = None
+                w_int_dict = None
                 if gptq_quantizers is not None:
                     # ActQuantWrapper name: "model.layers.0.self_attn.q_proj"
                     # GPTQ key:            "model.layers.0.self_attn.q_proj.module"
@@ -373,7 +378,12 @@ def train() -> None:
                     if 'main' not in wq_dict:
                         wq_dict = None  # no match found
 
-                m.prepare_real_quant_weights(w_bits=w_bits, w_quantizers=wq_dict)
+                if gptq_int_weights is not None:
+                    base_key = name + '.module'
+                    if base_key in gptq_int_weights:
+                        w_int_dict = gptq_int_weights[base_key]
+
+                m.prepare_real_quant_weights(w_bits=w_bits, w_quantizers=wq_dict, w_int_weights=w_int_dict)
                 if getattr(m, '_real_quant_ready', False):
                     m.forward = m.forward_real_quant
                     real_quant_count += 1

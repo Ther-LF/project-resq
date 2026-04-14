@@ -116,6 +116,7 @@ class GPTQ:
         groupsize=-1,
         actorder=False,
         static_groups=False,
+        save_int_weights=True,
     ):
         W_org = self.layer.weight.data.clone()
         W_org = W_org.float()
@@ -163,6 +164,7 @@ class GPTQ:
 
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
+        Q_int = torch.zeros_like(W, dtype=torch.int16) if save_int_weights else None
 
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
@@ -210,10 +212,19 @@ class GPTQ:
                         self.quantizer = groups[idx // groupsize]
                 if mp and (i1+i) >= high_dim:
                     q = self.high_quantizer.quantize(w.unsqueeze(1)).flatten()
+                    if save_int_weights:
+                        q_int_val, _, _ = self.high_quantizer.quantize_to_int(w.unsqueeze(1))
+                        Q_int[: , i1+i] = q_int_val.flatten()
                 elif mp and (i1+i) < low_dim:
                     q = self.low_quantizer.quantize(w.unsqueeze(1)).flatten()
+                    if save_int_weights:
+                        q_int_val, _, _ = self.low_quantizer.quantize_to_int(w.unsqueeze(1))
+                        Q_int[:, i1+i] = q_int_val.flatten()
                 else:
                     q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
+                    if save_int_weights:
+                        q_int_val, _, _ = self.quantizer.quantize_to_int(w.unsqueeze(1))
+                        Q_int[:, i1+i] = q_int_val.flatten()
                 Q1[:, i] = q
                 Losses1[:, i] = (w - q) ** 2 / d**2
 
@@ -234,10 +245,14 @@ class GPTQ:
 
         if actorder:
             Q = Q[:, invperm]
+            if Q_int is not None:
+                Q_int = Q_int[:, invperm]
 
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
             self.layer.weight.data.dtype
         )
+        # Store integer weights for real quant
+        self.Q_int = Q_int.reshape(self.layer.weight.shape) if Q_int is not None else None
 
         if torch.any(torch.isnan(self.layer.weight.data)):
             logging.warning("NaN in weights")
@@ -315,6 +330,7 @@ def gptq_fwrd(model, dataloader, dev, args):
     position_embeddings = cache["position_embeddings"]
 
     quantizers = {}
+    int_weights = {}  # Store integer weight tensors for real quant
     sequential = [
         [
             "self_attn.k_proj.module",
@@ -430,6 +446,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                     static_groups=False,
                 )
                 quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer.cpu()
+                # Save integer weights
+                if gptq[name].Q_int is not None:
+                    int_weights["model.layers.%d.%s" % (i, name)] = gptq[name].Q_int.cpu()
                 if mixed_precision:
                     quantizers["model.layers.%d.%s,high_quantizer" % (i, name)] = (
                         gptq[name].high_quantizer.cpu()
@@ -458,7 +477,7 @@ def gptq_fwrd(model, dataloader, dev, args):
     model.config.use_cache = use_cache
     utils.cleanup_memory(verbos=True)
     logging.info("-----GPTQ Quantization Done-----\n")
-    return quantizers
+    return quantizers, int_weights
 
 
 
