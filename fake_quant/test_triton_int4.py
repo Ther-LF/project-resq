@@ -23,10 +23,11 @@ def test_int4_dot_kernel(A_ptr, B_ptr, C_ptr, K: tl.constexpr, BLOCK: tl.constex
     b_hi = ((b_packed >> 4) & 0xF).to(tl.int8)
 
     # Sign extend: if value >= 8, subtract 16
-    a_lo = tl.where(a_lo >= 8, a_lo - 16, a_lo)
-    a_hi = tl.where(a_hi >= 8, a_hi - 16, a_hi)
-    b_lo = tl.where(b_lo >= 8, b_lo - 16, b_lo)
-    b_hi = tl.where(b_hi >= 8, b_hi - 16, b_hi)
+    # NOTE: tl.where promotes to int32, must cast back to int8 for tl.dot
+    a_lo = tl.where(a_lo >= 8, a_lo - 16, a_lo).to(tl.int8)
+    a_hi = tl.where(a_hi >= 8, a_hi - 16, a_hi).to(tl.int8)
+    b_lo = tl.where(b_lo >= 8, b_lo - 16, b_lo).to(tl.int8)
+    b_hi = tl.where(b_hi >= 8, b_hi - 16, b_hi).to(tl.int8)
 
     # Manual dot: sum over K
     # a has shape (BLOCK, K/2) unpacked to (BLOCK, K) via lo/hi
@@ -66,13 +67,30 @@ def main():
         test_int4_dot_kernel[(1,)](A_packed, B_packed, C, K=K, BLOCK=BLOCK)
         torch.cuda.synchronize()
         diff = (C - C_ref).abs().max().item()
-        print(f"INT4 unpack+dot: max diff={diff}")
+        print(f"INT4 unpack+dot ({BLOCK}x{K}): max diff={diff}")
         if diff == 0:
             print("PERFECT: Triton int4 (unpack in kernel + int8 dot) works!")
         else:
             print(f"Mismatch! Example C[0,:4]={C[0,:4].tolist()} vs ref={C_ref[0,:4].tolist()}")
     except Exception as e:
         print(f"FAILED: {e}")
+
+    # Test larger sizes
+    for BLOCK2, K2 in [(64, 128), (128, 256)]:
+        A2 = torch.randint(-8, 7, (BLOCK2, K2), dtype=torch.int8, device='cuda')
+        B2 = torch.randint(-8, 7, (BLOCK2, K2), dtype=torch.int8, device='cuda')
+        A2p = pack_int4_signed(A2)
+        B2p = pack_int4_signed(B2)
+        C2 = torch.zeros(BLOCK2, BLOCK2, dtype=torch.int32, device='cuda')
+        C2_ref = (A2.float() @ B2.float().T).int()
+        try:
+            test_int4_dot_kernel[(1,)](A2p, B2p, C2, K=K2, BLOCK=BLOCK2)
+            torch.cuda.synchronize()
+            diff2 = (C2 - C2_ref).abs().max().item()
+            status = 'OK' if diff2 == 0 else 'FAIL'
+            print(f"INT4 unpack+dot ({BLOCK2}x{K2}): max diff={diff2} {status}")
+        except Exception as e:
+            print(f"INT4 ({BLOCK2}x{K2}): FAILED - {e}")
 
 
 if __name__ == '__main__':
