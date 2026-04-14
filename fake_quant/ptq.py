@@ -343,10 +343,37 @@ def train() -> None:
         from utils.quant_utils import ActQuantWrapper
         log.info("Enabling real quantization mode...")
         w_bits = ptq_args.w_bits if ptq_args.w_bits < 16 else None
+
+        # Load GPTQ quantizers if available (from saved checkpoint)
+        gptq_quantizers = None
+        if ptq_args.load_qmodel_path and w_bits is not None:
+            import os
+            qmodel = torch.load(ptq_args.load_qmodel_path, map_location='cpu')
+            if 'w_quantizers' in qmodel:
+                gptq_quantizers = qmodel['w_quantizers']
+                log.info(f"Loaded {len(gptq_quantizers)} GPTQ quantizers from checkpoint")
+            del qmodel
+
         real_quant_count = 0
         for name, m in model.named_modules():
             if isinstance(m, ActQuantWrapper):
-                m.prepare_real_quant_weights(w_bits=w_bits)
+                # Build per-layer quantizer dict for this wrapper
+                wq_dict = None
+                if gptq_quantizers is not None:
+                    # ActQuantWrapper name: "model.layers.0.self_attn.q_proj"
+                    # GPTQ key:            "model.layers.0.self_attn.q_proj.module"
+                    base_key = name + '.module'
+                    wq_dict = {}
+                    if base_key in gptq_quantizers:
+                        wq_dict['main'] = gptq_quantizers[base_key]
+                    if base_key + ',high_quantizer' in gptq_quantizers:
+                        wq_dict['high'] = gptq_quantizers[base_key + ',high_quantizer']
+                    if base_key + ',low_quantizer' in gptq_quantizers:
+                        wq_dict['low'] = gptq_quantizers[base_key + ',low_quantizer']
+                    if 'main' not in wq_dict:
+                        wq_dict = None  # no match found
+
+                m.prepare_real_quant_weights(w_bits=w_bits, w_quantizers=wq_dict)
                 if getattr(m, '_real_quant_ready', False):
                     m.forward = m.forward_real_quant
                     real_quant_count += 1

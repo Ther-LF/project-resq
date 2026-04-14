@@ -478,7 +478,7 @@ class ActQuantWrapper(torch.nn.Module):
 
         return x
 
-    def prepare_real_quant_weights(self, w_bits=None):
+    def prepare_real_quant_weights(self, w_bits=None, w_quantizers=None):
         """Pre-quantize weights for real integer GEMM inference.
 
         Splits weight along K dimension into precision groups matching
@@ -488,15 +488,14 @@ class ActQuantWrapper(torch.nn.Module):
         - main group: w_bits (default 4 with GPTQ, or 8 without)
         - high group: high_bits (8-bit)
         - low group: low_bits (2-bit)
-        This gives: INT4_act × INT4_weight (main) + INT8_act × INT8_weight (high)
 
-        If GPTQ was used (w_bits < 16), the weights already contain GPTQ's
-        quantize→dequantize values. Re-quantizing at the same precision
-        introduces negligible additional error.
+        If w_quantizers dict is provided (from GPTQ checkpoint), uses the
+        exact GPTQ scale/zero for re-quantization to avoid any granularity
+        mismatch.
 
         After calling this, use forward_real_quant() instead of forward().
         """
-        W = self.module.weight.data  # (N, K)
+        W = self.module.weight.data  # (N, K) - already GPTQ dequant'd if w_bits<16
         K = W.shape[1]
         quantizer = self.quantizer
 
@@ -507,20 +506,10 @@ class ActQuantWrapper(torch.nn.Module):
         low_dim = quantizer.low_bits_length
         high_dim_start = K - quantizer.high_bits_length
 
-        # Weight quantization groupsize (along K dim)
-        w_groupsize = 128
-
-        # Determine per-group weight precision (matching activation precision)
-        # main group: use w_bits if provided, else match activation bits
-        W_BITS_M = w_bits if w_bits is not None else quantizer.bits
+        # Determine per-group weight precision
+        W_BITS_M = w_bits if w_bits is not None else 8
         W_BITS_H = quantizer.high_bits if quantizer.high_bits_length > 0 else W_BITS_M
         W_BITS_L = quantizer.low_bits if quantizer.low_bits_length > 0 else W_BITS_M
-
-        # Use per-channel weight quantization (groupsize = K_group) to match GPTQ's
-        # per-channel scale. GPTQ uses perchannel=True, so using per-group with a
-        # different groupsize would introduce re-quantization error.
-        # Set w_groupsize to -1 to signal per-channel (handled below).
-        use_perchannel = (w_bits is not None)  # GPTQ was used → per-channel
 
         # Handle activation groupsize > 0 (e.g., o_proj with groupsize=64)
         if quantizer.groupsize > 0:
@@ -538,32 +527,63 @@ class ActQuantWrapper(torch.nn.Module):
             W_h = W[:, high_dim_start:] if quantizer.high_bits_length > 0 else None
             W_l = W[:, :low_dim] if quantizer.low_bits_length > 0 else None
 
-        # When GPTQ was used (per-channel), set groupsize = K_group to match
-        gs_m = W_m.shape[1] if use_perchannel else w_groupsize
-        gs_h = W_h.shape[1] if (use_perchannel and W_h is not None) else w_groupsize
-        gs_l = W_l.shape[1] if (use_perchannel and W_l is not None) else w_groupsize
+        # If GPTQ quantizers available, use their scale for exact re-quantization
+        if w_quantizers is not None:
+            q_m, s_m = self._requant_with_gptq_scale(W_m, w_quantizers['main'])
+            self.register_buffer('W_m_int', q_m)
+            self.register_buffer('W_m_scale', s_m)
+            self._w_groupsize_m = W_m.shape[1]  # per-channel
 
-        q_m, s_m = self._quantize_weight_per_group(W_m, W_BITS_M, gs_m)
-        self.register_buffer('W_m_int', q_m)
-        self.register_buffer('W_m_scale', s_m)
-        self._w_groupsize_m = gs_m
-        self._w_bits_m = W_BITS_M
+            if W_h is not None and 'high' in w_quantizers:
+                q_h, s_h = self._requant_with_gptq_scale(W_h, w_quantizers['high'])
+                self.register_buffer('W_h_int', q_h)
+                self.register_buffer('W_h_scale', s_h)
+                self._w_groupsize_h = W_h.shape[1]
 
-        if W_h is not None:
-            q_h, s_h = self._quantize_weight_per_group(W_h, W_BITS_H, gs_h)
-            self.register_buffer('W_h_int', q_h)
-            self.register_buffer('W_h_scale', s_h)
-            self._w_groupsize_h = gs_h
-            self._w_bits_h = W_BITS_H
+            if W_l is not None and 'low' in w_quantizers:
+                q_l, s_l = self._requant_with_gptq_scale(W_l, w_quantizers['low'])
+                self.register_buffer('W_l_int', q_l)
+                self.register_buffer('W_l_scale', s_l)
+                self._w_groupsize_l = W_l.shape[1]
+        else:
+            # No GPTQ quantizers: use per-group RTN (for w_bits=16 or standalone)
+            w_groupsize = 128
+            q_m, s_m = self._quantize_weight_per_group(W_m, W_BITS_M, w_groupsize)
+            self.register_buffer('W_m_int', q_m)
+            self.register_buffer('W_m_scale', s_m)
+            self._w_groupsize_m = w_groupsize
 
-        if W_l is not None:
-            q_l, s_l = self._quantize_weight_per_group(W_l, W_BITS_L, gs_l)
-            self.register_buffer('W_l_int', q_l)
-            self.register_buffer('W_l_scale', s_l)
-            self._w_groupsize_l = gs_l
-            self._w_bits_l = W_BITS_L
+            if W_h is not None:
+                q_h, s_h = self._quantize_weight_per_group(W_h, W_BITS_H, w_groupsize)
+                self.register_buffer('W_h_int', q_h)
+                self.register_buffer('W_h_scale', s_h)
+                self._w_groupsize_h = w_groupsize
+
+            if W_l is not None:
+                q_l, s_l = self._quantize_weight_per_group(W_l, W_BITS_L, w_groupsize)
+                self.register_buffer('W_l_int', q_l)
+                self.register_buffer('W_l_scale', s_l)
+                self._w_groupsize_l = w_groupsize
 
         self._real_quant_ready = True
+
+    @staticmethod
+    def _requant_with_gptq_scale(W, wq):
+        """Re-quantize using GPTQ's original scale (per-channel symmetric).
+
+        W: (N, K) dequantized fp16 weight from GPTQ
+        wq: WeightQuantizer with .scale, .zero, .maxq from GPTQ
+        Returns integer values and scale matching GPTQ exactly.
+        """
+        scale = wq.scale.to(W.device)  # (N, 1) per-channel
+        maxq = wq.maxq.to(W.device)
+        if wq.sym:
+            q = torch.clamp(torch.round(W / scale), -(maxq + 1), maxq)
+        else:
+            zero = wq.zero.to(W.device)
+            q = torch.clamp(torch.round(W / scale) + zero, 0, maxq)
+            q = q - zero  # center to get signed integers
+        return q.half(), scale.half()
 
     @staticmethod
     def _quantize_weight_per_group(W, bits, groupsize):
