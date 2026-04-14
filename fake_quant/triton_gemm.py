@@ -70,6 +70,9 @@ def _scaled_int_gemm_kernel(
     scale_a: (M, num_groups) float32, per-group activation scale
     scale_b: (N,) float32, per-channel weight scale
     C: (M, N) float32 output
+
+    Per-group mode: dequantizes per-element by looking up scale_a[m, k//G] for
+    each k, then does fp32 accumulation. Correct for any group_size vs BLOCK_K.
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -104,28 +107,34 @@ def _scaled_int_gemm_kernel(
         # Load B tile (int8)
         b = tl.load(b_ptrs, mask=(offs_n[:, None] < N) & (k_offs[None, :] < K), other=0)
 
-        # Integer dot product: int8 × int8 → int32 (exact, uses tensor core)
-        dot_int32 = tl.dot(a, tl.trans(b), out_dtype=tl.int32)
-        dot_f32 = dot_int32.to(tl.float32)
-
         if QUANT_GROUP_SIZE > 0:
-            # Per-group scale: each K-tile corresponds to one activation group
-            # (assumes BLOCK_K == QUANT_GROUP_SIZE for best results)
-            group_idx = k_start // QUANT_GROUP_SIZE
-            sa = tl.load(scale_a_ptr + offs_m * stride_sa_m + group_idx * stride_sa_g,
-                         mask=offs_m < M, other=1.0)
-            # Apply per-group act scale: (BLOCK_M, 1) * (BLOCK_M, BLOCK_N)
-            acc += sa[:, None] * dot_f32
+            # Per-group scale: dequant A to fp32, then do fp32 matmul with B
+            # Each element a[m,k] gets scale_a[m, k // QUANT_GROUP_SIZE]
+            # Compute group index for each k in this tile
+            group_indices = k_offs // QUANT_GROUP_SIZE  # (BLOCK_K,)
+            # Load scales for all groups touched by this tile
+            # sa_tile[m, k] = scale_a[m, group_indices[k]]
+            sa_tile = tl.load(
+                scale_a_ptr + offs_m[:, None] * stride_sa_m + group_indices[None, :] * stride_sa_g,
+                mask=(offs_m[:, None] < M) & (k_offs[None, :] < K),
+                other=1.0,
+            )
+            # Dequant A: float = scale * int
+            a_f32 = sa_tile * a.to(tl.float32)  # (BLOCK_M, BLOCK_K)
+            b_f32 = b.to(tl.float32)             # (BLOCK_N, BLOCK_K)
+            # FP32 matmul for this tile
+            acc += tl.dot(a_f32, tl.trans(b_f32))
         else:
-            # Per-token scale: same scale for all K, apply once at the end
-            acc += dot_f32
+            # Per-token scale: pure integer dot, apply scale at the end
+            dot_int32 = tl.dot(a, tl.trans(b), out_dtype=tl.int32)
+            acc += dot_int32.to(tl.float32)
 
         # Advance pointers
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
     if QUANT_GROUP_SIZE > 0:
-        # Weight scale applied after accumulation: (1, BLOCK_N) * (BLOCK_M, BLOCK_N)
+        # Weight scale applied after accumulation
         acc = acc * sb[None, :]
     else:
         # Per-token: apply both act scale and weight scale

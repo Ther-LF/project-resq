@@ -25,13 +25,7 @@ except ImportError:
     HAS_TRITON = False
     print("WARNING: triton_gemm not found. Triton tests will be skipped.")
 
-# Try to import CUTLASS GEMM extension (optional)
-try:
-    import resq_gemm
-    HAS_CUTLASS = True
-    print("CUTLASS GEMM extension loaded successfully")
-except ImportError:
-    HAS_CUTLASS = False
+# CUTLASS removed — fully using Triton now
 
 
 # ============================================================
@@ -126,20 +120,6 @@ def _center_and_flatten(act_quant):
         return q_flat, s_flat, False
 
 
-def _pack_int4(vals):
-    """Pack int4 values (range [-8,7]) into uint8: two values per byte.
-
-    vals: (M, K) tensor with int4 values
-    Returns: (M, K//2) uint8 tensor, CUTLASS int4b_t packing (low nibble first)
-    """
-    assert vals.shape[-1] % 2 == 0, "K must be even for int4 packing"
-    v = vals.to(torch.int8)
-    lo = v[..., 0::2] & 0xF  # even indices -> low nibble
-    hi = v[..., 1::2] & 0xF  # odd indices -> high nibble
-    packed = (hi << 4) | lo
-    return packed.to(torch.uint8)
-
-
 # ============================================================
 # GEMM Implementations
 # ============================================================
@@ -153,7 +133,7 @@ def gemm_fp16_baseline(x_fp16, W_fp16):
     return (x_flat @ W_fp16.T).reshape(*x_fp16.shape[:-1], -1)
 
 
-def _real_quant_single_group(q_x_flat, s_x_flat, q_w, s_w, use_cutlass=False):
+def _real_quant_single_group(q_x_flat, s_x_flat, q_w, s_w):
     """Single-group real quant matmul: y = s_x * s_w * (q_x @ q_w^T).
 
     q_x_flat: (M, K) centered int values as float
@@ -161,25 +141,8 @@ def _real_quant_single_group(q_x_flat, s_x_flat, q_w, s_w, use_cutlass=False):
     q_w: (N, K) centered int values as half
     s_w: (N, 1) per-channel weight scale
     """
-    M, K = q_x_flat.shape
-    N = q_w.shape[0]
-
-    if use_cutlass and HAS_CUTLASS:
-        # Determine which CUTLASS kernel to use based on value range
-        val_max = max(q_x_flat.abs().max().item(), q_w.abs().max().item())
-        if val_max <= 7:
-            # INT4 range: use INT4 GEMM
-            q_x_i4 = _pack_int4(q_x_flat)
-            q_w_i4 = _pack_int4(q_w)
-            y_int = resq_gemm.gemm_s4s4s32(q_x_i4, q_w_i4, K).float()
-        else:
-            # INT8 range: use INT8 GEMM
-            q_x_i8 = q_x_flat.to(torch.int8).contiguous()
-            q_w_i8 = q_w.to(torch.int8).contiguous()
-            y_int = resq_gemm.gemm_s8s8s32(q_x_i8, q_w_i8).float()
-    else:
-        # Fallback: fp32 matmul
-        y_int = q_x_flat.float() @ q_w.float().T
+    # fp32 matmul (exact reference)
+    y_int = q_x_flat.float() @ q_w.float().T
 
     # Apply scales: (M,1) * (1,N) * (M,N)
     y = s_x_flat * s_w.flatten().unsqueeze(0) * y_int
@@ -187,9 +150,8 @@ def _real_quant_single_group(q_x_flat, s_x_flat, q_w, s_w, use_cutlass=False):
 
 
 def gemm_real_quant(act_quant_main, act_quant_high,
-                    weight_int_main, weight_int_high,
-                    use_cutlass=False):
-    """Real quant GEMM with per-token or per-group scale handling."""
+                    weight_int_main, weight_int_high):
+    """Real quant GEMM with per-token or per-group scale handling (fp32 reference)."""
     q_w_m = weight_int_main['q_int'].cuda()
     s_w_m = weight_int_main['scale'].cuda()
 
@@ -201,12 +163,12 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 
     if not grouped:
         # === Per-token scale: single matmul per precision group ===
-        y_m = _real_quant_single_group(q_x_m, s_x_m, q_w_m, s_w_m, use_cutlass)
+        y_m = _real_quant_single_group(q_x_m, s_x_m, q_w_m, s_w_m)
 
         y_h = torch.zeros_like(y_m)
         if act_quant_high is not None and q_w_h is not None:
             q_x_h, s_x_h, _ = _center_and_flatten(act_quant_high)
-            y_h = _real_quant_single_group(q_x_h, s_x_h, q_w_h, s_w_h, use_cutlass)
+            y_h = _real_quant_single_group(q_x_h, s_x_h, q_w_h, s_w_h)
 
         y = (y_m + y_h).half()
         return y
@@ -225,7 +187,7 @@ def gemm_real_quant(act_quant_main, act_quant_high,
             q_x_g = q_x_m_flat[:, g, :].contiguous()
             q_w_g = q_w_m_grouped[:, g, :].contiguous()
             s_x_g = s_x_m_flat[:, g, :]
-            y += _real_quant_single_group(q_x_g, s_x_g, q_w_g, s_w_m, use_cutlass)
+            y += _real_quant_single_group(q_x_g, s_x_g, q_w_g, s_w_m)
 
         # High group
         if act_quant_high is not None and q_w_h is not None:
@@ -239,7 +201,7 @@ def gemm_real_quant(act_quant_main, act_quant_high,
                 q_x_g = q_x_h_flat[:, g, :].contiguous()
                 q_w_g = q_w_h_grouped[:, g, :].contiguous()
                 s_x_g = s_x_h_flat[:, g, :]
-                y += _real_quant_single_group(q_x_g, s_x_g, q_w_g, s_w_h, use_cutlass)
+                y += _real_quant_single_group(q_x_g, s_x_g, q_w_g, s_w_h)
 
         return y.half().reshape(batch, seq, N)
 
@@ -247,11 +209,20 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 def gemm_triton_scaled_int(act_quant_main, act_quant_high,
                            weight_int_main, weight_int_high,
                            group_size=-1):
-    """Triton scaled integer GEMM: handles per-token and per-group scale natively."""
+    """Triton scaled integer GEMM: handles per-token and per-group scale natively.
+
+    Falls back to fp32 reference for groups whose centered values overflow int8.
+    """
     q_w_m = weight_int_main['q_int'].cuda()
     s_w_m = weight_int_main['scale'].cuda()
 
     q_x_m, s_x_m, grouped = _center_and_flatten(act_quant_main)
+
+    def _can_use_int8(q_x, q_w):
+        """Check if centered values fit in int8 [-128, 127]."""
+        x_max = q_x.abs().max().item()
+        w_max = q_w.abs().max().item()
+        return x_max <= 127 and w_max <= 127
 
     if grouped:
         # Per-group: q_x is (batch, seq, ngroups, group_k), flatten to (M, K_total)
@@ -267,8 +238,13 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
         s_x_flat = s_x_m  # (M, 1)
         gs = -1
 
-    y = scaled_int_gemm(q_x_flat.to(torch.int8), q_w_m.to(torch.int8),
-                        s_x_flat, s_w_m, group_size=gs)
+    if _can_use_int8(q_x_flat, q_w_m):
+        y = scaled_int_gemm(q_x_flat.to(torch.int8), q_w_m.to(torch.int8),
+                            s_x_flat, s_w_m, group_size=gs)
+    else:
+        # Fallback: dequant + fp16 matmul via reference path
+        y = gemm_real_quant(act_quant_main, None, weight_int_main, None)
+        y = y.float()
 
     # High group
     if act_quant_high is not None and weight_int_high is not None:
@@ -284,8 +260,14 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
             q_x_h_flat = q_x_h
             s_x_h_flat = s_x_h
 
-        y_h = scaled_int_gemm(q_x_h_flat.to(torch.int8), q_w_h.to(torch.int8),
-                              s_x_h_flat, s_w_h, group_size=gs)
+        if _can_use_int8(q_x_h_flat, q_w_h):
+            y_h = scaled_int_gemm(q_x_h_flat.to(torch.int8), q_w_h.to(torch.int8),
+                                  s_x_h_flat, s_w_h, group_size=gs)
+        else:
+            # High group overflows int8 — use fp32 reference
+            y_h = gemm_real_quant(act_quant_high, None, weight_int_high, None)
+            y_h = y_h.float()
+
         y = y + y_h
 
     if grouped:
@@ -304,17 +286,6 @@ def gemm_triton_fp16(x_fp16, W_fp16):
     return y.half().reshape(*x_fp16.shape[:-1], -1)
 
 
-def gemm_cutlass_fp16(x_fp16, W_fp16):
-    """CUTLASS FP16 x FP16 -> FP32 GEMM."""
-    if x_fp16.dim() > 3:
-        batch, seq = x_fp16.shape[0], x_fp16.shape[1]
-        x_fp16 = x_fp16.reshape(batch, seq, -1)
-    x_flat = x_fp16.reshape(-1, x_fp16.shape[-1]).contiguous()
-    W = W_fp16.contiguous()
-    y = resq_gemm.gemm_f16f16f32(x_flat.half(), W.half())
-    return y.half().reshape(*x_fp16.shape[:-1], -1)
-
-
 # ============================================================
 # Test definitions
 # ============================================================
@@ -325,8 +296,6 @@ ALL_TESTS = [
     ('Real (fp32 acc)', 'real_fp32'),
     ('Triton INT GEMM', 'triton_int'),
     ('Triton FP16', 'triton_fp16'),
-    ('CUTLASS INT8', 'cutlass_int'),
-    ('CUTLASS FP16', 'cutlass_fp16'),
 ]
 
 
@@ -423,11 +392,9 @@ def bench_single_layer(layer_dir, bs_key):
                     results[test_name] = result
                     continue
 
-                y = gemm_real_quant(act_main, act_high, w_main, w_high,
-                                    use_cutlass=False)
+                y = gemm_real_quant(act_main, act_high, w_main, w_high)
                 perf = compute_perf_metrics(
-                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high,
-                                           use_cutlass=False),
+                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high),
                     M, N, K, warmup=5, repeat=20)
 
             elif test_key == 'triton_int':
@@ -454,33 +421,6 @@ def bench_single_layer(layer_dir, bs_key):
                 y = gemm_triton_fp16(x_fp16, W_fp16)
                 perf = compute_perf_metrics(
                     lambda: gemm_triton_fp16(x_fp16, W_fp16), M, N, K)
-
-            elif test_key == 'cutlass_int':
-                if not HAS_CUTLASS:
-                    result['error'] = 'resq_gemm not installed'
-                    results[test_name] = result
-                    continue
-                if act_main is None or w_main is None:
-                    result['error'] = 'missing quant data'
-                    results[test_name] = result
-                    continue
-
-                y = gemm_real_quant(act_main, act_high, w_main, w_high,
-                                    use_cutlass=True)
-                perf = compute_perf_metrics(
-                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high,
-                                           use_cutlass=True),
-                    M, N, K, warmup=5, repeat=20)
-
-            elif test_key == 'cutlass_fp16':
-                if not HAS_CUTLASS:
-                    result['error'] = 'resq_gemm not installed'
-                    results[test_name] = result
-                    continue
-
-                y = gemm_cutlass_fp16(x_fp16, W_fp16)
-                perf = compute_perf_metrics(
-                    lambda: gemm_cutlass_fp16(x_fp16, W_fp16), M, N, K)
 
             else:
                 continue
