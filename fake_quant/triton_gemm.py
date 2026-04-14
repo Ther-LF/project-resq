@@ -99,56 +99,39 @@ def _scaled_int_gemm_kernel(
 
     for k_start in range(0, K, BLOCK_K):
         k_offs = k_start + offs_k
-        # Load A tile
+        # Load A tile (int8)
         a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (k_offs[None, :] < K), other=0)
-        # Load B tile
+        # Load B tile (int8)
         b = tl.load(b_ptrs, mask=(offs_n[:, None] < N) & (k_offs[None, :] < K), other=0)
 
-        # Compute partial int product: (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N)
-        # = (BLOCK_M, BLOCK_K) @ (BLOCK_N, BLOCK_K)^T
-        a_f32 = a.to(tl.float32)
-        b_f32 = b.to(tl.float32)
+        # Integer dot product: int8 × int8 → int32 (exact, uses tensor core)
+        dot_int32 = tl.dot(a, tl.trans(b), out_dtype=tl.int32)
+        dot_f32 = dot_int32.to(tl.float32)
 
         if QUANT_GROUP_SIZE > 0:
-            # Per-group scale: load scale for this K-tile's group
+            # Per-group scale: each K-tile corresponds to one activation group
+            # (assumes BLOCK_K == QUANT_GROUP_SIZE for best results)
             group_idx = k_start // QUANT_GROUP_SIZE
             sa = tl.load(scale_a_ptr + offs_m * stride_sa_m + group_idx * stride_sa_g,
                          mask=offs_m < M, other=1.0)
-            # Scale activation before accumulation: (BLOCK_M, 1) * (BLOCK_M, BLOCK_K)
-            a_f32 = a_f32 * sa[:, None]
-
-            # If BLOCK_K spans multiple groups, handle boundary
-            # For simplicity, assume BLOCK_K <= QUANT_GROUP_SIZE or is aligned
-            # (In practice, BLOCK_K=32 or 64, group_size=64, so at most 1 boundary)
-            if BLOCK_K > QUANT_GROUP_SIZE:
-                # Handle second group within this K tile
-                group_boundary = (group_idx + 1) * QUANT_GROUP_SIZE - k_start
-                if group_boundary < BLOCK_K:
-                    sa2 = tl.load(scale_a_ptr + offs_m * stride_sa_m + (group_idx + 1) * stride_sa_g,
-                                  mask=offs_m < M, other=1.0)
-                    mask_g2 = (offs_k >= group_boundary)[None, :]
-                    # Correct the scale for elements in the second group
-                    a_f32 = tl.where(
-                        tl.broadcast_to(mask_g2, (BLOCK_M, BLOCK_K)),
-                        a.to(tl.float32) * sa2[:, None],
-                        a_f32
-                    )
+            # Apply per-group act scale: (BLOCK_M, 1) * (BLOCK_M, BLOCK_N)
+            acc += sa[:, None] * dot_f32
         else:
-            # Per-token scale: load once per M row
-            sa = tl.load(scale_a_ptr + offs_m * stride_sa_m,
-                         mask=offs_m < M, other=1.0)
-            a_f32 = a_f32 * sa[:, None]
-
-        # Apply weight scale and accumulate
-        # a_f32: (BLOCK_M, BLOCK_K), already scaled by scale_a
-        # b_f32: (BLOCK_N, BLOCK_K), need to scale by scale_b
-        b_scaled = b_f32 * sb[:, None]  # (BLOCK_N, BLOCK_K)
-
-        acc += tl.dot(a_f32.to(tl.float16), tl.trans(b_scaled.to(tl.float16)))
+            # Per-token scale: same scale for all K, apply once at the end
+            acc += dot_f32
 
         # Advance pointers
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
+
+    if QUANT_GROUP_SIZE > 0:
+        # Weight scale applied after accumulation: (1, BLOCK_N) * (BLOCK_M, BLOCK_N)
+        acc = acc * sb[None, :]
+    else:
+        # Per-token: apply both act scale and weight scale
+        sa = tl.load(scale_a_ptr + offs_m * stride_sa_m,
+                     mask=offs_m < M, other=1.0)
+        acc = sa[:, None] * sb[None, :] * acc
 
     # Store result
     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn

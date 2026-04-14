@@ -62,3 +62,5 @@
 - **[2026-04-14 22:34:22]** [python] edit `fake_quant/bench_gemm.py`
 - **[2026-04-14 22:40:06]** [test] create `fake_quant/test_triton_int.py`
 - **[2026-04-14 22:41:00]** [test] edit `fake_quant/test_triton_int.py`
+- **[2026-04-14 22:42:50]** [python] edit `fake_quant/triton_gemm.py`
+- **[2026-04-14 22:43:23]** [test] create `fake_quant/test_triton_int4.py`
