@@ -513,24 +513,31 @@ class ActQuantWrapper(torch.nn.Module):
         W_BITS_L = quantizer.low_bits if quantizer.low_bits_length > 0 else W_BITS_M
 
         # Handle activation groupsize > 0 (e.g., o_proj with groupsize=64)
+        # NOTE: GPTQ uses contiguous [low|main|high] layout regardless of activation groupsize.
+        # The weight is already rearranged by rearrange_columns(), so globally:
+        # [low_cols | main_cols | high_cols]. GPTQ quantizes in this layout.
+        # We always use contiguous split for weight (matching GPTQ), not per-group split.
         if quantizer.groupsize > 0:
             N = W.shape[0]
             gs = quantizer.groupsize
             num_groups = K // gs
-            W_grouped = W.reshape(N, num_groups, gs)
-            high_dim_g = gs - quantizer.high_bits_length
 
-            W_m = W_grouped[:, :, low_dim:high_dim_g].reshape(N, -1)
-            W_h = W_grouped[:, :, high_dim_g:].reshape(N, -1) if quantizer.high_bits_length > 0 else None
-            W_l = W_grouped[:, :, :low_dim].reshape(N, -1) if quantizer.low_bits_length > 0 else None
+            # For GPTQ weights, use contiguous split matching GPTQ's layout
+            # GPTQ's high_dim is based on global model_dim:
+            # high_bits_length for grouped = per_group_high * num_groups
+            global_high = quantizer.high_bits_length * num_groups
+            global_low = quantizer.low_bits_length * num_groups
+            high_dim_start_global = K - global_high
 
-            # Also split integer weights if provided
+            W_m = W[:, global_low:high_dim_start_global]
+            W_h = W[:, high_dim_start_global:] if global_high > 0 else None
+            W_l = W[:, :global_low] if global_low > 0 else None
+
             if w_int_weights is not None:
                 Q_int = w_int_weights.to(W.device)
-                Q_grouped = Q_int.reshape(N, num_groups, gs)
-                Q_m = Q_grouped[:, :, low_dim:high_dim_g].reshape(N, -1)
-                Q_h = Q_grouped[:, :, high_dim_g:].reshape(N, -1) if quantizer.high_bits_length > 0 else None
-                Q_l = Q_grouped[:, :, :low_dim].reshape(N, -1) if quantizer.low_bits_length > 0 else None
+                Q_m = Q_int[:, global_low:high_dim_start_global]
+                Q_h = Q_int[:, high_dim_start_global:] if global_high > 0 else None
+                Q_l = Q_int[:, :global_low] if global_low > 0 else None
             else:
                 Q_m, Q_h, Q_l = None, None, None
         else:
@@ -831,25 +838,15 @@ class ActQuantWrapper(torch.nn.Module):
 
         # Reassemble in original K layout
         if quantizer.groupsize > 0:
-            # Interleaved: within each activation group, layout is [low | main | high]
-            gs = quantizer.groupsize
-            K = self.module.weight.shape[1]
-            num_act_groups = K // gs
-            low_dim = quantizer.low_bits_length
-            high_dim = gs - quantizer.high_bits_length
-            main_dim = high_dim - low_dim
-
-            # Reshape back to per-activation-group
-            W_m_g = W_m_deq.reshape(N, num_act_groups, main_dim)
-            parts_g = []
+            # GPTQ uses contiguous layout [low | main | high] globally,
+            # so just concatenate contiguously (same as non-grouped)
+            parts = []
             if W_l_deq is not None:
-                W_l_g = W_l_deq.reshape(N, num_act_groups, low_dim)
-                parts_g.append(W_l_g)
-            parts_g.append(W_m_g)
+                parts.append(W_l_deq)
+            parts.append(W_m_deq)
             if W_h_deq is not None:
-                W_h_g = W_h_deq.reshape(N, num_act_groups, quantizer.high_bits_length)
-                parts_g.append(W_h_g)
-            W_deq = torch.cat(parts_g, dim=2).reshape(N, K)
+                parts.append(W_h_deq)
+            W_deq = torch.cat(parts, dim=1)
         else:
             # Contiguous: layout is [low | main | high]
             parts = []

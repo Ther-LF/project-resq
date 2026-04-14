@@ -29,3 +29,6 @@
 - **[2026-04-14 20:07:59]** [build] create `fake_quant/3_eval_w4a4_real_v2.sh`
 - **[2026-04-14 20:34:36]** [python] edit `fake_quant/utils/quant_utils.py`
 - **[2026-04-14 20:34:56]** [python] edit `fake_quant/utils/quant_utils.py`
+- **[2026-04-14 20:39:15]** [python] edit `fake_quant/utils/quant_utils.py`
+- **[2026-04-14 20:39:47]** [python] edit `fake_quant/utils/quant_utils.py`
+- **[2026-04-14 20:40:08]** [python] edit `fake_quant/utils/quant_utils.py`
