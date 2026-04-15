@@ -26,7 +26,7 @@ setup(
             extra_compile_args={
                 'cxx': ['-std=c++17', '-O3'],
                 'nvcc': [
-                    '-arch=sm_90',
+                    '-gencode', 'arch=compute_90a,code=sm_90a',
                     '-std=c++17',
                     '-O3',
                     '--expt-relaxed-constexpr',
