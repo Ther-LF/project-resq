@@ -209,11 +209,19 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 def gemm_triton_scaled_int(act_quant_main, act_quant_high,
                            weight_int_main, weight_int_high,
                            group_size=-1):
-    """Triton mixed-precision GEMM — all computation in Triton kernels.
+    """Triton mixed-precision GEMM — ALL computation via INT8 Tensor Core.
 
-    Main group (4-bit, centered [-8,7]): Triton INT8 tensor core kernel.
-    High group (8-bit, may overflow int8): dequant to fp16, Triton FP16 kernel.
-    No fallback to PyTorch matmul.
+    Main group (4-bit asym, q_int [0,15]):
+        centered = q_int - zero → [-12,12] → fits int8 → INT8 TC
+        Y_main = scale_x * scale_w * (centered_int8 @ q_w_int8^T)
+
+    High group (8-bit asym, q_int [0,255]):
+        Shift-128 trick to avoid zero_point overflow:
+        q_shifted = q_int - 128 → [-128,127] → fits int8 → INT8 TC
+        bias = (128 - zero) @ q_w^T  (precomputed)
+        Y_high = scale_x * scale_w * (q_shifted_int8 @ q_w_int8^T + bias)
+
+    No FP16 dequant fallback. Everything uses INT8 Tensor Core.
     """
     q_w_m = weight_int_main['q_int'].cuda()
     s_w_m = weight_int_main['scale'].cuda()
@@ -232,17 +240,17 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
         s_x_flat = s_x_m
         gs = -1
 
-    # Main group: INT8 Triton kernel (4-bit values always fit int8)
+    # Main group: centered values fit int8 → INT8 TC, no bias needed
     y = scaled_int_gemm(q_x_flat.to(torch.int8), q_w_m.to(torch.int8),
                         s_x_flat, s_w_m, group_size=gs)
 
-    # High group: dequant to fp16, then Triton FP16 kernel
+    # High group: shift-128 trick → INT8 TC with precomputed bias
     if act_quant_high is not None and weight_int_high is not None:
-        q_w_h = weight_int_high['q_int'].cuda()
+        q_w_h = weight_int_high['q_int'].cuda().float()  # (N, K_h) int values as fp16
         s_w_h = weight_int_high['scale'].cuda()
 
-        # Get raw quant data (before centering) for proper dequant
-        q_h_raw = act_quant_high['q_int'].cuda().float()
+        # Raw activation data (before any centering)
+        q_h_raw = act_quant_high['q_int'].cuda()   # int16, [0, 255]
         s_h = act_quant_high['scale'].cuda().float()
         z_h = act_quant_high.get('zero', None)
         if z_h is not None:
@@ -251,23 +259,67 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
         grouped_h = (s_h.dim() > 3)
 
         if grouped_h:
-            # (batch, seq, ngroups, group_k_h)
+            # Per-group: q_h_raw (batch, seq, ngroups, gk_h), zero (batch, seq, ngroups, 1)
             b, sq, ng, gk_h = q_h_raw.shape
-            q_centered = q_h_raw - z_h if z_h is not None else q_h_raw
-            # s_h shape: (batch, seq, ngroups, 1)
-            x_h_fp16 = (q_centered * s_h).reshape(M, ng * gk_h).half()
+
+            # Shift: q_shifted = q_int - 128 → [-128, 127] → int8
+            q_shifted = (q_h_raw.to(torch.int16) - 128).to(torch.int8)
+            q_shifted_flat = q_shifted.reshape(M, ng * gk_h)
+
+            # Scale for high group: (M, ngroups)
+            s_h_flat = s_h.reshape(M, ng)
+
+            # Bias: (128 - zero) @ q_w^T, computed per-group then summed
+            # zero: (batch, seq, ngroups, 1) → (M, ngroups)
+            if z_h is not None:
+                zero_flat = z_h.reshape(M, ng)  # (M, ngroups), squeeze last dim=1
+                shift_minus_zero = 128.0 - zero_flat  # (M, ngroups)
+            else:
+                shift_minus_zero = torch.full((M, ng), 128.0, device=q_w_h.device)
+
+            # q_w_h: (N, K_h_total) → (N, ngroups, gk_h) → group colsums (N, ngroups)
+            q_w_h_grouped = q_w_h.reshape(q_w_h.shape[0], ng, gk_h)
+            w_group_colsum = q_w_h_grouped.sum(dim=2)  # (N, ngroups)
+
+            # bias[m, n] = sum_g scale_a[m,g] * shift_minus_zero[m,g] * w_group_colsum[n,g]
+            # = (scale_a * shift_minus_zero) @ w_group_colsum^T
+            bias = (s_h_flat * shift_minus_zero) @ w_group_colsum.T  # (M, N)
+
+            gs_h = gk_h
         else:
-            # Per-token: (batch, seq, K_h)
-            q_centered = q_h_raw - z_h if z_h is not None else q_h_raw
-            # s_h may be (batch, seq, K_h) with same value — take [:,:,:1]
-            s_h_tok = s_h[..., :1] if s_h.dim() == 3 else s_h
-            x_h_fp16 = (q_centered * s_h_tok).reshape(M, -1).half()
+            # Per-token: q_h_raw (batch, seq, K_h), zero (batch, seq, K_h) or (batch, seq, 1)
+            K_h = q_h_raw.shape[-1]
 
-        # Dequant weight: w_fp16 = q_w * scale_w
-        w_h_fp16 = (q_w_h.float() * s_w_h.float().flatten().unsqueeze(1)).half()
+            # Shift: q_shifted = q_int - 128 → int8
+            q_shifted = (q_h_raw.to(torch.int16) - 128).to(torch.int8)
+            q_shifted_flat = q_shifted.reshape(M, K_h)
 
-        # Triton FP16 GEMM for high group
-        y_h = triton_fp16_gemm(x_h_fp16, w_h_fp16)
+            # Per-token scale: (M, 1)
+            s_h_tok = _extract_per_token_scale(s_h).reshape(M, 1)
+            s_h_flat = s_h_tok
+
+            # Bias: (128 - zero) * colsum(q_w), per-token scalar × per-channel sum
+            if z_h is not None:
+                # zero may be (batch, seq, K_h) broadcast or (batch, seq, 1)
+                if z_h.dim() == 3 and z_h.shape[-1] > 1:
+                    zero_tok = z_h[..., :1]  # all same value per token
+                else:
+                    zero_tok = z_h
+                zero_flat = zero_tok.reshape(M, 1)  # (M, 1)
+            else:
+                zero_flat = torch.zeros(M, 1, device=q_w_h.device)
+
+            shift_minus_zero = 128.0 - zero_flat  # (M, 1)
+            w_colsum = q_w_h.sum(dim=1, keepdim=True).T  # (1, N)
+
+            # bias[m, n] = scale_a[m] * (128 - zero[m]) * colsum_w[n]
+            bias = (s_h_flat * shift_minus_zero) @ w_colsum  # (M, N)
+
+            gs_h = -1
+
+        # Run INT8 TC GEMM with bias
+        y_h = scaled_int_gemm(q_shifted_flat, q_w_h.to(torch.int8),
+                              s_h_flat, s_w_h, group_size=gs_h, bias=bias)
         y = y + y_h
 
     if grouped:
