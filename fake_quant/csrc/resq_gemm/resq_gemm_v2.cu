@@ -127,8 +127,8 @@ using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
 using StrideC = typename GemmKernel::StrideC;
 using StrideD = typename GemmKernel::StrideD;
 
-// Scale stride: (N, scale_k) row-major
-using StrideS = cutlass::detail::TagToStrideB_t<cutlass::layout::RowMajor>;
+// Scale stride: must match what the collective mainloop expects
+using StrideS = typename CollectiveMainloopScaleOnly::StrideScale;
 
 #define CUTLASS_CHECK(status)                                         \
   {                                                                   \
