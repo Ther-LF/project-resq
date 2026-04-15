@@ -38,8 +38,10 @@ torch::Tensor gemm_s8s8_grouped_scale(
     const int N = B.size(0);
 
     int scale_k = (K + group_size - 1) / group_size;
-    TORCH_CHECK(scale_B.size(0) == N, "scale_B rows must match N");
-    TORCH_CHECK(scale_B.size(1) == scale_k, "scale_B cols must match ceil(K/group_size)");
+    // scale_B must be (scale_k, N) contiguous — CUTLASS MN-major layout
+    // This means fastest-changing dim is N (columns), slowest is scale_k (groups)
+    TORCH_CHECK(scale_B.size(0) == scale_k, "scale_B must be (scale_k, N), got row=", scale_B.size(0), " expected=", scale_k);
+    TORCH_CHECK(scale_B.size(1) == N, "scale_B must be (scale_k, N), got col=", scale_B.size(1), " expected=", N);
 
     auto D = torch::empty({M, N}, torch::TensorOptions().device(A.device()).dtype(torch::kFloat32));
     auto stream = at::cuda::getCurrentCUDAStream().stream();
