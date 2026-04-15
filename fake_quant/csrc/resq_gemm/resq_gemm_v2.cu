@@ -62,8 +62,8 @@ using ElementCompute     = float;
 using ArchTag       = cutlass::arch::Sm90;
 using OperatorClass  = cutlass::arch::OpClassTensorOp;
 
-// Tile shapes
-constexpr int TileShapeK = 128 * 8 / cutlass::sizeof_bits<ElementA>::value;  // 128 for int8
+// Tile shapes — TileShapeK=64 to support group_size=64 (padded from 56)
+constexpr int TileShapeK = 64;
 using TileShape    = Shape<_128, _128, cute::Int<TileShapeK>>;
 using ClusterShape = Shape<_1, _1, _1>;
 
