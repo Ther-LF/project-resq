@@ -299,6 +299,8 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
             s_h_flat = s_h_tok
 
             # Bias: (128 - zero) * colsum(q_w), per-token scalar × per-channel sum
+            # NOTE: kernel applies scale_a * scale_w AFTER adding bias,
+            #       so bias must NOT include scale_a.
             if z_h is not None:
                 # zero may be (batch, seq, K_h) broadcast or (batch, seq, 1)
                 if z_h.dim() == 3 and z_h.shape[-1] > 1:
@@ -312,8 +314,9 @@ def gemm_triton_scaled_int(act_quant_main, act_quant_high,
             shift_minus_zero = 128.0 - zero_flat  # (M, 1)
             w_colsum = q_w_h.sum(dim=1, keepdim=True).T  # (1, N)
 
-            # bias[m, n] = scale_a[m] * (128 - zero[m]) * colsum_w[n]
-            bias = (s_h_flat * shift_minus_zero) @ w_colsum  # (M, N)
+            # bias[m, n] = (128 - zero[m]) * colsum_w[n]
+            # scale_a and scale_w are applied by the kernel after bias
+            bias = shift_minus_zero @ w_colsum  # (M, N)
 
             gs_h = -1
 
