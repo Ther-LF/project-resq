@@ -702,13 +702,13 @@ class ActQuantWrapper(torch.nn.Module):
         transpose=False,
         column_order=None,
     ):
-        """Real quantization forward: integer quantize -> integer-equivalent matmul -> dequantize.
+        """Real quantization forward using shift+bias INT GEMM formula.
 
-        Strategy:
-        - Quantize activation to integers (per-token or per-group)
-        - Dequantize weight from stored int8 per-group representation
-        - For groupsize>0: dequant activation per-group, reshape flat, single matmul
-        - For groupsize=-1: split matmul by precision groups for future int kernel
+        Simulates exact INT Tensor Core computation in fp32:
+        - Main (4-bit): shift-8 + bias, q_shifted ∈ [-8,7]
+        - High (8-bit): shift-128 + bias, q_shifted ∈ [-128,127]
+        - Per-token: single matmul per precision group
+        - Per-group (o_proj): loop over groups, accumulate
         """
         x_dtype = x.dtype
 
@@ -721,75 +721,150 @@ class ActQuantWrapper(torch.nn.Module):
             else:
                 return self.module(x).to(x_dtype)
 
-        # 2. Compute per-token activation quantization parameters
+        # 2. Compute activation quantization parameters
         self.quantizer.find_params(x)
         quantizer = self.quantizer
 
-        # 3. Split activation and quantize to centered integers
-        if quantizer.groupsize > 0:
+        # 3. Reshape for groupsize if needed
+        grouped = (quantizer.groupsize > 0)
+        if grouped:
             init_shape = x.shape  # (batch, seq, K)
-            x = x.reshape(x.shape[0], x.shape[1], x.shape[2] // quantizer.groupsize, quantizer.groupsize)
+            x = x.reshape(x.shape[0], x.shape[1],
+                          x.shape[2] // quantizer.groupsize, quantizer.groupsize)
 
+        # 4. Split and quantize activation to unsigned integers
         low_dim = quantizer.low_bits_length
         high_dim = x.shape[-1] - quantizer.high_bits_length
         x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
 
-        # Quantize and dequant each precision group
+        # Main group: quantize to unsigned int [0, maxq]
         if quantizer.sym:
-            dq_m = quantizer.scale * torch.clamp(torch.round(x_m / quantizer.scale), -(quantizer.maxq + 1), quantizer.maxq)
+            q_m = torch.clamp(torch.round(x_m / quantizer.scale), -(quantizer.maxq + 1), quantizer.maxq)
+            s_x_m = quantizer.scale
+            z_x_m = torch.zeros(1, device=x.device)
+            shift_m = 0.0  # symmetric: no shift needed
         else:
-            q_m_int = torch.clamp(torch.round(x_m / quantizer.scale) + quantizer.zero, 0, quantizer.maxq)
-            dq_m = quantizer.scale * (q_m_int - quantizer.zero)
+            q_m = torch.clamp(torch.round(x_m / quantizer.scale) + quantizer.zero, 0, quantizer.maxq)
+            s_x_m = quantizer.scale
+            z_x_m = quantizer.zero
+            shift_m = float(quantizer.maxq + 1) / 2.0  # 8 for 4-bit
 
-        dq_h = None
+        # High group
+        q_h, s_x_h, z_x_h, shift_h = None, None, None, None
         if quantizer.high_bits_length > 0:
             if quantizer.sym:
-                dq_h = quantizer.scale_h * torch.clamp(torch.round(x_h / quantizer.scale_h), -(quantizer.maxq_h + 1), quantizer.maxq_h)
+                q_h = torch.clamp(torch.round(x_h / quantizer.scale_h), -(quantizer.maxq_h + 1), quantizer.maxq_h)
+                s_x_h = quantizer.scale_h
+                z_x_h = torch.zeros(1, device=x.device)
+                shift_h = 0.0
             else:
-                q_h_int = torch.clamp(torch.round(x_h / quantizer.scale_h) + quantizer.zero_h, 0, quantizer.maxq_h)
-                dq_h = quantizer.scale_h * (q_h_int - quantizer.zero_h)
-
-        dq_l = None
-        if quantizer.low_bits_length > 0:
-            if quantizer.sym:
-                dq_l = quantizer.scale_l * torch.clamp(torch.round(x_l / quantizer.scale_l), -(quantizer.maxq_l + 1), quantizer.maxq_l)
-            else:
-                q_l_int = torch.clamp(torch.round(x_l / quantizer.scale_l) + quantizer.zero_l, 0, quantizer.maxq_l)
-                dq_l = quantizer.scale_l * (q_l_int - quantizer.zero_l)
+                q_h = torch.clamp(torch.round(x_h / quantizer.scale_h) + quantizer.zero_h, 0, quantizer.maxq_h)
+                s_x_h = quantizer.scale_h
+                z_x_h = quantizer.zero_h
+                shift_h = float(quantizer.maxq_h + 1) / 2.0  # 128 for 8-bit
 
         self.quantizer.free()
 
-        # 4. Reassemble dequantized activation in original layout
-        parts = []
-        if dq_l is not None:
-            parts.append(dq_l)
-        parts.append(dq_m)
-        if dq_h is not None:
-            parts.append(dq_h)
-        dq_x = torch.cat(parts, dim=-1)  # (..., groupsize) or (..., K)
+        # 5. INT GEMM via shift+bias formula
+        # Weight integers are already stored centered (e.g. [-8,7] for main, [-128,127] for high)
+        q_w_m = self.W_m_int.float()  # (N, K_m), centered
+        s_w_m = self.W_m_scale.float()  # (N, 1)
+        q_w_h = self.W_h_int.float() if hasattr(self, 'W_h_int') else None
+        s_w_h = self.W_h_scale.float() if hasattr(self, 'W_h_int') else None
 
-        if quantizer.groupsize > 0:
-            dq_x = dq_x.reshape(init_shape)  # (batch, seq, K)
+        N = q_w_m.shape[0]
 
-        # 4b. Apply column_order permutation (critical for o_proj/down_proj)
-        if column_order is not None:
-            dq_x = dq_x[..., column_order]
+        if not grouped:
+            # === Per-token path ===
+            # s_x is (batch, seq, 1) for per-token, extract to (M, 1)
+            batch_shape = q_m.shape[:-1]
+            M = q_m[..., 0:1].reshape(-1, 1).shape[0]
 
-        # 5. Dequantize weight and matmul
-        # Weight was quantized to 8-bit per-group and stored in interleaved layout
-        W_deq = self._dequant_weight()
-        M_flat = dq_x.reshape(-1, dq_x.shape[-1])  # (M, K)
-        y = (M_flat.float() @ W_deq.float().T).half()  # fp32 matmul to avoid overflow
+            def _per_token_scale(s):
+                return s[..., :1].reshape(-1, 1)
+
+            # Main: shift+bias
+            q_m_flat = q_m.reshape(-1, q_m.shape[-1]).float()
+            s_x_m_tok = _per_token_scale(s_x_m).float()
+
+            if quantizer.sym:
+                # Symmetric: q_m is already centered, no shift needed
+                y = s_x_m_tok * s_w_m.flatten().unsqueeze(0) * (q_m_flat @ q_w_m.T)
+            else:
+                z_x_m_tok = _per_token_scale(z_x_m).float()
+                q_shifted = q_m_flat - shift_m
+                w_colsum = q_w_m.sum(dim=1, keepdim=True).T  # (1, N)
+                bias = (shift_m - z_x_m_tok) @ w_colsum  # (M, N)
+                y = s_x_m_tok * s_w_m.flatten().unsqueeze(0) * (q_shifted @ q_w_m.T + bias)
+
+            # High: shift+bias
+            if q_h is not None and q_w_h is not None:
+                q_h_flat = q_h.reshape(-1, q_h.shape[-1]).float()
+                s_x_h_tok = _per_token_scale(s_x_h).float()
+                if quantizer.sym:
+                    y += s_x_h_tok * s_w_h.flatten().unsqueeze(0) * (q_h_flat @ q_w_h.T)
+                else:
+                    z_x_h_tok = _per_token_scale(z_x_h).float()
+                    q_shifted = q_h_flat - shift_h
+                    w_colsum = q_w_h.sum(dim=1, keepdim=True).T
+                    bias = (shift_h - z_x_h_tok) @ w_colsum
+                    y += s_x_h_tok * s_w_h.flatten().unsqueeze(0) * (q_shifted @ q_w_h.T + bias)
+
+            y = y.half().reshape(*batch_shape, N)
+
+        else:
+            # === Per-group path (o_proj) ===
+            # q_m: (batch, seq, ngroups, group_k_m)
+            batch, seq, ngroups, group_k_m = q_m.shape
+            M = batch * seq
+
+            q_m_flat = q_m.reshape(M, ngroups, group_k_m).float()
+            s_x_m_flat = s_x_m.reshape(M, ngroups, -1).float()
+            z_x_m_flat = z_x_m.reshape(M, ngroups, -1).float() if not quantizer.sym else None
+
+            y = torch.zeros(M, N, device=x.device, dtype=torch.float32)
+
+            # Main groups
+            for g in range(ngroups):
+                q_x_g = q_m_flat[:, g, :]  # (M, group_k_m)
+                s_x_g = s_x_m_flat[:, g, :]  # (M, 1)
+                q_w_g = q_w_m[:, g*group_k_m:(g+1)*group_k_m]  # (N, group_k_m)
+
+                if quantizer.sym:
+                    y += s_x_g * s_w_m.flatten().unsqueeze(0) * (q_x_g @ q_w_g.T)
+                else:
+                    z_x_g = z_x_m_flat[:, g, :]  # (M, 1)
+                    q_shifted = q_x_g - shift_m
+                    w_colsum = q_w_g.sum(dim=1, keepdim=True).T
+                    bias = (shift_m - z_x_g) @ w_colsum
+                    y += s_x_g * s_w_m.flatten().unsqueeze(0) * (q_shifted @ q_w_g.T + bias)
+
+            # High groups
+            if q_h is not None and q_w_h is not None:
+                group_k_h = q_h.shape[-1]
+                q_h_flat = q_h.reshape(M, ngroups, group_k_h).float()
+                s_x_h_flat = s_x_h.reshape(M, ngroups, -1).float()
+                z_x_h_flat = z_x_h.reshape(M, ngroups, -1).float() if not quantizer.sym else None
+
+                for g in range(ngroups):
+                    q_x_g = q_h_flat[:, g, :]
+                    s_x_g = s_x_h_flat[:, g, :]
+                    q_w_g = q_w_h[:, g*group_k_h:(g+1)*group_k_h]
+
+                    if quantizer.sym:
+                        y += s_x_g * s_w_h.flatten().unsqueeze(0) * (q_x_g @ q_w_g.T)
+                    else:
+                        z_x_g = z_x_h_flat[:, g, :]
+                        q_shifted = q_x_g - shift_h
+                        w_colsum = q_w_g.sum(dim=1, keepdim=True).T
+                        bias = (shift_h - z_x_g) @ w_colsum
+                        y += s_x_g * s_w_h.flatten().unsqueeze(0) * (q_shifted @ q_w_g.T + bias)
+
+            y = y.half().reshape(batch, seq, N)
 
         # Bias
         if self.module.bias is not None:
             y = y + self.module.bias
-
-        # Reshape back
-        if quantizer.groupsize > 0:
-            y = y.reshape(init_shape[0], init_shape[1], -1)
-        else:
-            y = y.reshape(*x_m.shape[:-1], -1)
 
         y = y.to(x_dtype)
 
