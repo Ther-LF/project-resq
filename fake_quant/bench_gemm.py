@@ -255,8 +255,8 @@ def gemm_real_quant(act_quant_main, act_quant_high,
             q_w_m_g = q_w_m.reshape(N, ngroups, group_k_m)  # (N, 32, 56)
             q_w_h_g = q_w_h.reshape(N, ngroups, group_k_h)  # (N, 32, 8)
             W_dq_g = torch.cat([
-                s_w_m * q_w_m_g,  # main groups dequant
-                s_w_h * q_w_h_g,  # high groups dequant
+                s_w_m.unsqueeze(-1) * q_w_m_g,  # (N,1,1) * (N,32,56) → (N,32,56)
+                s_w_h.unsqueeze(-1) * q_w_h_g,  # (N,1,1) * (N,32,8)  → (N,32,8)
             ], dim=-1)  # (N, 32, 64)
             W_dq = W_dq_g.reshape(N, -1)  # (N, 2048) interleaved
         else:
