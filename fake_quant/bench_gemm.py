@@ -105,20 +105,31 @@ def gemm_fp16_baseline(x_fp16, W_fp16):
 
 
 def _real_quant_single_group_main(q_x_raw, zero_x, s_x, q_w, s_w):
-    """Main group (4-bit) quant matmul using same formula as INT GEMM.
+    """Main group (4-bit) quant matmul using shift-8 + bias formula (same as INT4 GEMM).
 
-    Main group: centered = q_int - zero, values fit int8 [-12,12].
-    Formula: Y = s_x * s_w * (centered @ q_w^T)
+    Main group: q_int [0,15], needs shift-8 to fit int4 [-8,7].
+    Shift-8 trick (same idea as high group's shift-128):
+        q_shifted = q_int - 8             → [-8,7] fits int4
+        bias = (8 - zero) * colsum(q_w)   → precomputed per (M, N)
+        Y = s_x * s_w * (q_shifted @ q_w^T + bias)
 
     q_x_raw: (M, K) raw unsigned q_int as float (e.g., [0,15])
-    zero_x:  (M, 1) or (M, K) zero point as float
+    zero_x:  (M, 1) or scalar zero point as float
     s_x:     (M, 1) per-token scale as float
     q_w:     (N, K) centered weight int as float (e.g., [-8,7])
     s_w:     (N, 1) per-channel weight scale
     """
-    centered = q_x_raw - zero_x  # same as what INT GEMM does
-    y_int = centered.float() @ q_w.float().T  # fp32 simulates int matmul
-    y = s_x * s_w.flatten().unsqueeze(0) * y_int
+    q_shifted = q_x_raw - 8.0  # [-8, 7], fits int4
+
+    # Precompute bias: (8 - zero) * colsum(q_w)
+    shift_minus_zero = 8.0 - zero_x  # (M, 1)
+    w_colsum = q_w.float().sum(dim=1, keepdim=True).T  # (1, N)
+    bias = shift_minus_zero @ w_colsum  # (M, N)
+
+    # fp32 simulates: q_shifted_int4 @ q_w_int4^T
+    y_int = q_shifted.float() @ q_w.float().T  # fp32 simulates int matmul
+
+    y = s_x * s_w.flatten().unsqueeze(0) * (y_int + bias)
     return y
 
 
