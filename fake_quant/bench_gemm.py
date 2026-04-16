@@ -351,14 +351,12 @@ def bench_single_layer(layer_dir, bs_key):
     meta = data.get('metadata', {})
     N, K = W_fp16.shape
 
-    # Keep original W_fp16 before column reorder (for reference, not used in real quant)
-
-    # Apply column reorder if present (o_proj).
-    # FP16 baseline needs reordered data since x_reord @ W_reord^T = x_orig @ W_orig^T.
+    # Apply column reorder to activation if present (o_proj).
+    # W_fp16 is already rearranged by rearrange_columns() in the model,
+    # so only x_fp16 needs reordering: x[..., col_order] @ W_rearranged^T.
     col_order = data.get('column_order', None)
     if col_order is not None:
         x_fp16 = x_fp16[..., col_order]
-        W_fp16 = W_fp16[:, col_order]
 
     if x_fp16.dim() > 3:
         M = x_fp16.shape[0] * x_fp16.shape[1]
