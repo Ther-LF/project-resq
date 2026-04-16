@@ -176,6 +176,13 @@ class GEMMDataCollector:
             # Apply rotation (same as forward does)
             x_rotated = wrapper._apply_rotation(x.clone())
 
+            # Apply column reorder if present (o_proj)
+            # Weight W is already rearranged by rearrange_columns(),
+            # so we must reorder x to match before computing baselines.
+            col_order = getattr(wrapper, '_column_order', None)
+            if col_order is not None:
+                x_rotated = x_rotated[..., col_order]
+
             # Compute FP16 baseline: x_rotated @ W.T (no quantization)
             W = wrapper.module.weight.data
             x_flat = x_rotated.reshape(-1, x_rotated.shape[-1])
