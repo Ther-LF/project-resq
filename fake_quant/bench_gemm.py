@@ -133,75 +133,147 @@ def gemm_fp16_baseline(x_fp16, W_fp16):
     return (x_flat @ W_fp16.T).reshape(*x_fp16.shape[:-1], -1)
 
 
-def _real_quant_single_group(q_x_flat, s_x_flat, q_w, s_w):
-    """Single-group real quant matmul: y = s_x * s_w * (q_x @ q_w^T).
+def _real_quant_single_group_main(q_x_raw, zero_x, s_x, q_w, s_w):
+    """Main group (4-bit) quant matmul using same formula as INT GEMM.
 
-    q_x_flat: (M, K) centered int values as float
-    s_x_flat: (M, 1) per-token scale
-    q_w: (N, K) centered int values as half
-    s_w: (N, 1) per-channel weight scale
+    Main group: centered = q_int - zero, values fit int8 [-12,12].
+    Formula: Y = s_x * s_w * (centered @ q_w^T)
+
+    q_x_raw: (M, K) raw unsigned q_int as float (e.g., [0,15])
+    zero_x:  (M, 1) or (M, K) zero point as float
+    s_x:     (M, 1) per-token scale as float
+    q_w:     (N, K) centered weight int as float (e.g., [-8,7])
+    s_w:     (N, 1) per-channel weight scale
     """
-    # fp32 matmul (exact reference)
-    y_int = q_x_flat.float() @ q_w.float().T
+    centered = q_x_raw - zero_x  # same as what INT GEMM does
+    y_int = centered.float() @ q_w.float().T  # fp32 simulates int matmul
+    y = s_x * s_w.flatten().unsqueeze(0) * y_int
+    return y
 
-    # Apply scales: (M,1) * (1,N) * (M,N)
-    y = s_x_flat * s_w.flatten().unsqueeze(0) * y_int
+
+def _real_quant_single_group_high(q_x_raw, zero_x, s_x, q_w, s_w):
+    """High group (8-bit) quant matmul using shift-128 + bias formula (same as INT GEMM).
+
+    High group: q_int [0,255], centered overflows int8.
+    Shift-128 trick:
+        q_shifted = q_int - 128            → [-128,127] fits int8
+        bias = (128 - zero) * colsum(q_w)  → precomputed per (M, N)
+        Y = s_x * s_w * (q_shifted @ q_w^T + bias)
+
+    q_x_raw: (M, K) raw unsigned q_int as float (e.g., [0,255])
+    zero_x:  (M, 1) or scalar zero point as float
+    s_x:     (M, 1) per-token scale as float
+    q_w:     (N, K) centered weight int as float (e.g., [-128,127])
+    s_w:     (N, 1) per-channel weight scale
+    """
+    q_shifted = q_x_raw - 128.0  # [-128, 127], same as INT GEMM .to(int8)
+
+    # Precompute bias: (128 - zero) * colsum(q_w)
+    shift_minus_zero = 128.0 - zero_x  # (M, 1)
+    w_colsum = q_w.float().sum(dim=1, keepdim=True).T  # (1, N)
+    bias = shift_minus_zero @ w_colsum  # (M, N)
+
+    # fp32 simulates: q_shifted_int8 @ q_w_int8^T
+    y_int = q_shifted.float() @ q_w.float().T  # fp32 simulates int matmul
+
+    y = s_x * s_w.flatten().unsqueeze(0) * (y_int + bias)
     return y
 
 
 def gemm_real_quant(act_quant_main, act_quant_high,
                     weight_int_main, weight_int_high):
-    """Real quant GEMM with per-token or per-group scale handling (fp32 reference)."""
-    q_w_m = weight_int_main['q_int'].cuda()
-    s_w_m = weight_int_main['scale'].cuda()
+    """Quantization accuracy baseline — fp32 simulation of exact INT GEMM formula.
 
-    q_w_h = weight_int_high['q_int'].cuda() if weight_int_high else None
-    s_w_h = weight_int_high['scale'].cuda() if weight_int_high else None
+    Uses the SAME formula as the INT TC kernel (shift-128 + bias for high group),
+    but computes matmul in fp32 instead of INT8/INT4 tensor core.
+    If the INT kernel is implemented correctly, its output should match this exactly.
+    """
+    q_w_m = weight_int_main['q_int'].cuda().float()
+    s_w_m = weight_int_main['scale'].cuda().float()
 
-    q_x_m, s_x_m, grouped = _center_and_flatten(act_quant_main)
+    q_w_h = weight_int_high['q_int'].cuda().float() if weight_int_high else None
+    s_w_h = weight_int_high['scale'].cuda().float() if weight_int_high else None
+
+    # Get raw (uncentered) activation data
+    q_x_m_raw = act_quant_main['q_int'].cuda().float()
+    s_x_m = act_quant_main['scale'].cuda().float()
+    z_x_m = act_quant_main.get('zero', None)
+    if z_x_m is not None:
+        z_x_m = z_x_m.cuda().float()
+    else:
+        z_x_m = torch.zeros_like(q_x_m_raw[..., :1])
+
+    grouped = (s_x_m.dim() > 3)  # (batch, seq, ngroups, 1) = grouped
     N = q_w_m.shape[0]
 
     if not grouped:
-        # === Per-token scale: single matmul per precision group ===
-        y_m = _real_quant_single_group(q_x_m, s_x_m, q_w_m, s_w_m)
+        # === Per-token ===
+        s_x_tok = _extract_per_token_scale(s_x_m).reshape(-1, 1)
+        z_x_tok = _extract_per_token_scale(z_x_m).reshape(-1, 1) if z_x_m.shape[-1] > 1 else z_x_m.reshape(-1, 1)
+        q_x_flat = q_x_m_raw.reshape(-1, q_x_m_raw.shape[-1])
+        M = q_x_flat.shape[0]
 
-        y_h = torch.zeros_like(y_m)
+        y_m = _real_quant_single_group_main(q_x_flat, z_x_tok, s_x_tok, q_w_m, s_w_m)
+
+        y_h = torch.zeros(M, N, device='cuda', dtype=torch.float32)
         if act_quant_high is not None and q_w_h is not None:
-            q_x_h, s_x_h, _ = _center_and_flatten(act_quant_high)
-            y_h = _real_quant_single_group(q_x_h, s_x_h, q_w_h, s_w_h)
+            q_x_h_raw = act_quant_high['q_int'].cuda().float()
+            s_x_h = act_quant_high['scale'].cuda().float()
+            z_x_h = act_quant_high.get('zero', None)
+            if z_x_h is not None:
+                z_x_h = z_x_h.cuda().float()
+            else:
+                z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
+
+            s_x_h_tok = _extract_per_token_scale(s_x_h).reshape(-1, 1)
+            z_x_h_tok = _extract_per_token_scale(z_x_h).reshape(-1, 1) if z_x_h.shape[-1] > 1 else z_x_h.reshape(-1, 1)
+            q_x_h_flat = q_x_h_raw.reshape(-1, q_x_h_raw.shape[-1])
+
+            y_h = _real_quant_single_group_high(q_x_h_flat, z_x_h_tok, s_x_h_tok, q_w_h, s_w_h)
 
         y = (y_m + y_h).half()
         return y
 
     else:
-        # === Per-group scale: ngroups small GEMMs ===
-        batch, seq, ngroups, group_k_m = q_x_m.shape
+        # === Per-group (o_proj) ===
+        batch, seq, ngroups, group_k_m = q_x_m_raw.shape
         M = batch * seq
 
-        q_x_m_flat = q_x_m.reshape(M, ngroups, group_k_m)
+        q_x_m_flat = q_x_m_raw.reshape(M, ngroups, group_k_m)
         s_x_m_flat = s_x_m.reshape(M, ngroups, 1)
+        z_x_m_flat = z_x_m.reshape(M, ngroups, 1) if z_x_m.dim() > 3 else z_x_m.reshape(M, -1, 1)
         q_w_m_grouped = q_w_m.reshape(N, ngroups, group_k_m)
 
         y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
         for g in range(ngroups):
             q_x_g = q_x_m_flat[:, g, :].contiguous()
             q_w_g = q_w_m_grouped[:, g, :].contiguous()
-            s_x_g = s_x_m_flat[:, g, :]
-            y += _real_quant_single_group(q_x_g, s_x_g, q_w_g, s_w_m)
+            s_x_g = s_x_m_flat[:, g, :]  # (M, 1)
+            z_x_g = z_x_m_flat[:, g, :]  # (M, 1)
+            y += _real_quant_single_group_main(q_x_g, z_x_g, s_x_g, q_w_g, s_w_m)
 
         # High group
         if act_quant_high is not None and q_w_h is not None:
-            q_x_h, s_x_h, _ = _center_and_flatten(act_quant_high)
-            group_k_h = q_x_h.shape[-1]
-            q_x_h_flat = q_x_h.reshape(M, ngroups, group_k_h)
+            q_x_h_raw = act_quant_high['q_int'].cuda().float()
+            s_x_h = act_quant_high['scale'].cuda().float()
+            z_x_h = act_quant_high.get('zero', None)
+            if z_x_h is not None:
+                z_x_h = z_x_h.cuda().float()
+            else:
+                z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
+
+            group_k_h = q_x_h_raw.shape[-1]
+            q_x_h_flat = q_x_h_raw.reshape(M, ngroups, group_k_h)
             s_x_h_flat = s_x_h.reshape(M, ngroups, 1)
+            z_x_h_flat = z_x_h.reshape(M, ngroups, 1) if z_x_h.dim() > 3 else z_x_h.reshape(M, -1, 1)
             q_w_h_grouped = q_w_h.reshape(N, ngroups, group_k_h)
 
             for g in range(ngroups):
                 q_x_g = q_x_h_flat[:, g, :].contiguous()
                 q_w_g = q_w_h_grouped[:, g, :].contiguous()
                 s_x_g = s_x_h_flat[:, g, :]
-                y += _real_quant_single_group(q_x_g, s_x_g, q_w_g, s_w_h)
+                z_x_g = z_x_h_flat[:, g, :]
+                y += _real_quant_single_group_high(q_x_g, z_x_g, s_x_g, q_w_g, s_w_h)
 
         return y.half().reshape(batch, seq, N)
 
