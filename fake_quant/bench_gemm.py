@@ -226,18 +226,17 @@ def gemm_real_quant(act_quant_main, act_quant_high,
     else:
         # === Per-group (o_proj) ===
         # Activation is quantized per-group in ORIGINAL K space.
-        # Weight is in REARRANGED K space (GPTQ's rearrange_columns).
-        # Strategy: dequant activation per-group back to fp32 in original K,
+        # Each group of 64 cols has [main(56) | high(8)] interleaved.
+        # Weight is in REARRANGED K space: [all_main(1792) | all_high(256)].
+        # Strategy: dequant per-group, reconstruct interleaved layout,
         # then apply column_order to rearranged space, then matmul with weight.
         batch, seq, ngroups, group_k_m = q_x_m_raw.shape
         M = batch * seq
 
         # Dequant main activation: scale * (q_int - zero) per group
-        x_dq_m = s_x_m * (q_x_m_raw - z_x_m)  # (batch, seq, ngroups, group_k_m)
-        x_dq_m_flat = x_dq_m.reshape(batch, seq, -1)  # (batch, seq, K_main_orig)
+        x_dq_m = s_x_m * (q_x_m_raw - z_x_m)  # (batch, seq, ngroups, group_k_m=56)
 
         # Dequant high activation
-        x_dq_h_flat = torch.zeros(batch, seq, 0, device='cuda', dtype=torch.float32)
         if act_quant_high is not None and q_w_h is not None:
             q_x_h_raw = act_quant_high['q_int'].cuda().float()
             s_x_h = act_quant_high['scale'].cuda().float()
@@ -247,14 +246,14 @@ def gemm_real_quant(act_quant_main, act_quant_high,
             else:
                 z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
 
-            x_dq_h = s_x_h * (q_x_h_raw - z_x_h)  # (batch, seq, ngroups, group_k_h)
-            x_dq_h_flat = x_dq_h.reshape(batch, seq, -1)  # (batch, seq, K_high_orig)
+            x_dq_h = s_x_h * (q_x_h_raw - z_x_h)  # (batch, seq, ngroups, group_k_h=8)
 
-        # Concat in original K space: [main | high]
-        # NOTE: original space groups are interleaved: [g0_main, g1_main, ..., g0_high, g1_high, ...]
-        # But quantizer splits: x_m = x[..., low:high_start], x_h = x[..., high_start:]
-        # So flat layout is already [all_main | all_high] in original space
-        x_dq = torch.cat([x_dq_m_flat, x_dq_h_flat], dim=-1)  # (batch, seq, K)
+            # Interleave: [g0_main(56)|g0_high(8)|g1_main(56)|g1_high(8)|...]
+            x_dq = torch.cat([x_dq_m, x_dq_h], dim=-1)  # (batch, seq, ngroups, 64)
+        else:
+            x_dq = x_dq_m  # no high group
+
+        x_dq = x_dq.reshape(batch, seq, -1)  # (batch, seq, K) in original interleaved space
 
         # Apply column_order to map from original → rearranged K space
         if column_order is not None:
