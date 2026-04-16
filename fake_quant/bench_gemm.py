@@ -256,7 +256,6 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 
 ALL_TESTS = [
     ('FP16 baseline', 'fp16'),
-    ('Fake quant', 'fake'),
     ('Real (fp32 acc)', 'real_fp32'),
 ]
 
@@ -287,7 +286,7 @@ def load_layer_data(layer_dir, bs_key):
         if os.path.exists(path):
             data[f'act_quant_{group}'] = torch.load(path, map_location='cpu')
 
-    for kind in ['fp16_baseline', 'fake_quant', 'real_quant']:
+    for kind in ['fp16_baseline']:
         path = os.path.join(layer_dir, f'output_{kind}_{bs_key}.pt')
         if os.path.exists(path):
             data[f'output_{kind}'] = torch.load(path, map_location='cpu')
@@ -323,10 +322,9 @@ def bench_single_layer(layer_dir, bs_key):
 
     results = {}
 
-    # Reference outputs
+    # Reference output
     ref_fp16 = data.get('output_fp16_baseline',
                         gemm_fp16_baseline(x_fp16, W_fp16).cpu()).cuda()
-    ref_fake = data.get('output_fake_quant', ref_fp16).cuda()
 
     # Prepare common quant data
     act_main = data.get('act_quant_main')
@@ -335,16 +333,11 @@ def bench_single_layer(layer_dir, bs_key):
     w_high = data.get('weight_int_high')
 
     for test_name, test_key in ALL_TESTS:
-        result = {'accuracy_vs_fp16': None, 'accuracy_vs_fake': None, 'perf': None}
+        result = {'accuracy_vs_fp16': None, 'perf': None}
 
         try:
             if test_key == 'fp16':
                 y = gemm_fp16_baseline(x_fp16, W_fp16)
-                perf = compute_perf_metrics(
-                    lambda: gemm_fp16_baseline(x_fp16, W_fp16), M, N, K)
-
-            elif test_key == 'fake':
-                y = ref_fake.clone()
                 perf = compute_perf_metrics(
                     lambda: gemm_fp16_baseline(x_fp16, W_fp16), M, N, K)
 
@@ -364,7 +357,6 @@ def bench_single_layer(layer_dir, bs_key):
 
             y = y.cuda()
             result['accuracy_vs_fp16'] = compute_accuracy_metrics(y, ref_fp16)
-            result['accuracy_vs_fake'] = compute_accuracy_metrics(y, ref_fake)
             result['perf'] = perf
 
         except Exception as e:
@@ -411,7 +403,7 @@ def print_results_table(layer_name, results, bs_key):
             print(f"{test_name:<20} {'N/A':>10} {'':>10} {'':>10} {'':>10} {'':>8} {'':>8} {'':>8} {r['error']}")
             continue
 
-        acc = r.get('accuracy_vs_fake', r.get('accuracy_vs_fp16', {}))
+        acc = r.get('accuracy_vs_fp16', {})
         perf = r.get('perf', {})
         if not acc: acc = {}
         if not perf: perf = {}
