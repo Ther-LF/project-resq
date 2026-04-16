@@ -287,6 +287,11 @@ def load_layer_data(layer_dir, bs_key):
     if os.path.exists(path):
         data['weight_fp16'] = torch.load(path, map_location='cpu')
 
+    # Column order (o_proj has reordered K dimension)
+    path = os.path.join(layer_dir, 'column_order.pt')
+    if os.path.exists(path):
+        data['column_order'] = torch.load(path, map_location='cpu')
+
     for group in ['main', 'high', 'low']:
         path = os.path.join(layer_dir, f'weight_int_{group}.pt')
         if os.path.exists(path):
@@ -296,11 +301,6 @@ def load_layer_data(layer_dir, bs_key):
         path = os.path.join(layer_dir, f'act_quant_{group}_{bs_key}.pt')
         if os.path.exists(path):
             data[f'act_quant_{group}'] = torch.load(path, map_location='cpu')
-
-    for kind in ['fp16_baseline']:
-        path = os.path.join(layer_dir, f'output_{kind}_{bs_key}.pt')
-        if os.path.exists(path):
-            data[f'output_{kind}'] = torch.load(path, map_location='cpu')
 
     path = os.path.join(layer_dir, 'metadata.json')
     if os.path.exists(path):
@@ -326,6 +326,15 @@ def bench_single_layer(layer_dir, bs_key):
     meta = data.get('metadata', {})
     N, K = W_fp16.shape
 
+    # Apply column reorder if present (o_proj).
+    # Quant data (act_quant_*, weight_int_*) are stored in reordered K order.
+    # FP16 data (input_fp16, weight_fp16) are in original order.
+    # Reorder FP16 data to match, so FP16 baseline is a fair comparison.
+    col_order = data.get('column_order', None)
+    if col_order is not None:
+        x_fp16 = x_fp16[..., col_order]
+        W_fp16 = W_fp16[:, col_order]
+
     if x_fp16.dim() > 3:
         M = x_fp16.shape[0] * x_fp16.shape[1]
     else:
@@ -333,9 +342,9 @@ def bench_single_layer(layer_dir, bs_key):
 
     results = {}
 
-    # Reference output
-    ref_fp16 = data.get('output_fp16_baseline',
-                        gemm_fp16_baseline(x_fp16, W_fp16).cpu()).cuda()
+    # Reference output: FP16 matmul in (possibly reordered) space.
+    # Note: x_reord @ W_reord^T == x_orig @ W_orig^T (reorder cancels in matmul)
+    ref_fp16 = gemm_fp16_baseline(x_fp16, W_fp16).cuda()
 
     # Prepare common quant data
     act_main = data.get('act_quant_main')
