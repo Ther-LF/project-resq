@@ -16,16 +16,8 @@ import time
 import torch
 import torch.nn.functional as F
 
-# Try to import Triton GEMM kernels
-try:
-    from triton_gemm import scaled_int_gemm, triton_fp16_gemm
-    HAS_TRITON = True
-    print("Triton GEMM kernels loaded successfully")
-except ImportError:
-    HAS_TRITON = False
-    print("WARNING: triton_gemm not found. Triton tests will be skipped.")
-
-# CUTLASS removed — fully using Triton now
+# Triton and CUTLASS GEMM kernels removed — baseline uses fp32 simulation only.
+# Real INT TC kernels will be added later as separate baselines.
 
 
 # ============================================================
@@ -97,27 +89,6 @@ def _extract_per_token_scale(scale_tensor):
         return scale_tensor[..., :1]  # (batch, seq, 1)
     return scale_tensor
 
-
-def _center_and_flatten(act_quant):
-    """Get centered integer activations as flat (M, K_group) and per-token scale (M, 1)."""
-    q = act_quant['q_int'].cuda().float()
-    s = act_quant['scale'].cuda().float()
-    z = act_quant.get('zero', None)
-    if z is not None:
-        z = z.cuda().float()
-        q = q - z
-
-    grouped = (s.dim() > 3)  # (batch, seq, ngroups, 1) = grouped
-
-    if grouped:
-        # Return as-is for grouped handling
-        return q, s, True
-    else:
-        # Per-token: flatten to (M, K_group), scale to (M, 1)
-        s_per_token = _extract_per_token_scale(s)
-        q_flat = q.reshape(-1, q.shape[-1])
-        s_flat = s_per_token.reshape(-1, 1)
-        return q_flat, s_flat, False
 
 
 # ============================================================
@@ -278,140 +249,6 @@ def gemm_real_quant(act_quant_main, act_quant_high,
         return y.half().reshape(batch, seq, N)
 
 
-def gemm_triton_scaled_int(act_quant_main, act_quant_high,
-                           weight_int_main, weight_int_high,
-                           group_size=-1):
-    """Triton mixed-precision GEMM — ALL computation via INT8 Tensor Core.
-
-    Main group (4-bit asym, q_int [0,15]):
-        centered = q_int - zero → [-12,12] → fits int8 → INT8 TC
-        Y_main = scale_x * scale_w * (centered_int8 @ q_w_int8^T)
-
-    High group (8-bit asym, q_int [0,255]):
-        Shift-128 trick to avoid zero_point overflow:
-        q_shifted = q_int - 128 → [-128,127] → fits int8 → INT8 TC
-        bias = (128 - zero) @ q_w^T  (precomputed)
-        Y_high = scale_x * scale_w * (q_shifted_int8 @ q_w_int8^T + bias)
-
-    No FP16 dequant fallback. Everything uses INT8 Tensor Core.
-    """
-    q_w_m = weight_int_main['q_int'].cuda()
-    s_w_m = weight_int_main['scale'].cuda()
-
-    q_x_m, s_x_m, grouped = _center_and_flatten(act_quant_main)
-
-    if grouped:
-        batch, seq, ngroups, group_k = q_x_m.shape
-        M = batch * seq
-        q_x_flat = q_x_m.reshape(M, ngroups * group_k)
-        s_x_flat = s_x_m.reshape(M, ngroups)
-        gs = group_k
-    else:
-        M = q_x_m.shape[0]
-        q_x_flat = q_x_m
-        s_x_flat = s_x_m
-        gs = -1
-
-    # Main group: centered values fit int8 → INT8 TC, no bias needed
-    y = scaled_int_gemm(q_x_flat.to(torch.int8), q_w_m.to(torch.int8),
-                        s_x_flat, s_w_m, group_size=gs)
-
-    # High group: shift-128 trick → INT8 TC with precomputed bias
-    if act_quant_high is not None and weight_int_high is not None:
-        q_w_h = weight_int_high['q_int'].cuda().float()  # (N, K_h) int values as fp16
-        s_w_h = weight_int_high['scale'].cuda()
-
-        # Raw activation data (before any centering)
-        q_h_raw = act_quant_high['q_int'].cuda()   # int16, [0, 255]
-        s_h = act_quant_high['scale'].cuda().float()
-        z_h = act_quant_high.get('zero', None)
-        if z_h is not None:
-            z_h = z_h.cuda().float()
-
-        grouped_h = (s_h.dim() > 3)
-
-        if grouped_h:
-            # Per-group: q_h_raw (batch, seq, ngroups, gk_h), zero (batch, seq, ngroups, 1)
-            b, sq, ng, gk_h = q_h_raw.shape
-
-            # Shift: q_shifted = q_int - 128 → [-128, 127] → int8
-            q_shifted = (q_h_raw.to(torch.int16) - 128).to(torch.int8)
-            q_shifted_flat = q_shifted.reshape(M, ng * gk_h)
-
-            # Scale for high group: (M, ngroups)
-            s_h_flat = s_h.reshape(M, ng)
-
-            # Bias: (128 - zero) @ q_w^T, computed per-group then summed
-            # zero: (batch, seq, ngroups, 1) → (M, ngroups)
-            if z_h is not None:
-                zero_flat = z_h.reshape(M, ng)  # (M, ngroups), squeeze last dim=1
-                shift_minus_zero = 128.0 - zero_flat  # (M, ngroups)
-            else:
-                shift_minus_zero = torch.full((M, ng), 128.0, device=q_w_h.device)
-
-            # q_w_h: (N, K_h_total) → (N, ngroups, gk_h) → group colsums (N, ngroups)
-            q_w_h_grouped = q_w_h.reshape(q_w_h.shape[0], ng, gk_h)
-            w_group_colsum = q_w_h_grouped.sum(dim=2)  # (N, ngroups)
-
-            # bias[m, n] = sum_g scale_a[m,g] * shift_minus_zero[m,g] * w_group_colsum[n,g]
-            # = (scale_a * shift_minus_zero) @ w_group_colsum^T
-            bias = (s_h_flat * shift_minus_zero) @ w_group_colsum.T  # (M, N)
-
-            gs_h = gk_h
-        else:
-            # Per-token: q_h_raw (batch, seq, K_h), zero (batch, seq, K_h) or (batch, seq, 1)
-            K_h = q_h_raw.shape[-1]
-
-            # Shift: q_shifted = q_int - 128 → int8
-            q_shifted = (q_h_raw.to(torch.int16) - 128).to(torch.int8)
-            q_shifted_flat = q_shifted.reshape(M, K_h)
-
-            # Per-token scale: (M, 1)
-            s_h_tok = _extract_per_token_scale(s_h).reshape(M, 1)
-            s_h_flat = s_h_tok
-
-            # Bias: (128 - zero) * colsum(q_w), per-token scalar × per-channel sum
-            # NOTE: kernel applies scale_a * scale_w AFTER adding bias,
-            #       so bias must NOT include scale_a.
-            if z_h is not None:
-                # zero may be (batch, seq, K_h) broadcast or (batch, seq, 1)
-                if z_h.dim() == 3 and z_h.shape[-1] > 1:
-                    zero_tok = z_h[..., :1]  # all same value per token
-                else:
-                    zero_tok = z_h
-                zero_flat = zero_tok.reshape(M, 1)  # (M, 1)
-            else:
-                zero_flat = torch.zeros(M, 1, device=q_w_h.device)
-
-            shift_minus_zero = 128.0 - zero_flat  # (M, 1)
-            w_colsum = q_w_h.sum(dim=1, keepdim=True).T  # (1, N)
-
-            # bias[m, n] = (128 - zero[m]) * colsum_w[n]
-            # scale_a and scale_w are applied by the kernel after bias
-            bias = shift_minus_zero @ w_colsum  # (M, N)
-
-            gs_h = -1
-
-        # Run INT8 TC GEMM with bias
-        y_h = scaled_int_gemm(q_shifted_flat, q_w_h.to(torch.int8),
-                              s_h_flat, s_w_h, group_size=gs_h, bias=bias)
-        y = y + y_h
-
-    if grouped:
-        return y.half().reshape(batch, seq, -1)
-    return y.half()
-
-
-def gemm_triton_fp16(x_fp16, W_fp16):
-    """Triton FP16 × FP16 -> FP32 GEMM."""
-    if x_fp16.dim() > 3:
-        batch, seq = x_fp16.shape[0], x_fp16.shape[1]
-        x_fp16 = x_fp16.reshape(batch, seq, -1)
-    x_flat = x_fp16.reshape(-1, x_fp16.shape[-1]).contiguous()
-    W = W_fp16.contiguous()
-    y = triton_fp16_gemm(x_flat.half(), W.half())
-    return y.half().reshape(*x_fp16.shape[:-1], -1)
-
 
 # ============================================================
 # Test definitions
@@ -421,8 +258,6 @@ ALL_TESTS = [
     ('FP16 baseline', 'fp16'),
     ('Fake quant', 'fake'),
     ('Real (fp32 acc)', 'real_fp32'),
-    ('Triton INT GEMM', 'triton_int'),
-    ('Triton FP16', 'triton_fp16'),
 ]
 
 
@@ -523,31 +358,6 @@ def bench_single_layer(layer_dir, bs_key):
                 perf = compute_perf_metrics(
                     lambda: gemm_real_quant(act_main, act_high, w_main, w_high),
                     M, N, K, warmup=5, repeat=20)
-
-            elif test_key == 'triton_int':
-                if not HAS_TRITON:
-                    result['error'] = 'triton_gemm not available'
-                    results[test_name] = result
-                    continue
-                if act_main is None or w_main is None:
-                    result['error'] = 'missing quant data'
-                    results[test_name] = result
-                    continue
-
-                y = gemm_triton_scaled_int(act_main, act_high, w_main, w_high)
-                perf = compute_perf_metrics(
-                    lambda: gemm_triton_scaled_int(act_main, act_high, w_main, w_high),
-                    M, N, K, warmup=5, repeat=20)
-
-            elif test_key == 'triton_fp16':
-                if not HAS_TRITON:
-                    result['error'] = 'triton_gemm not available'
-                    results[test_name] = result
-                    continue
-
-                y = gemm_triton_fp16(x_fp16, W_fp16)
-                perf = compute_perf_metrics(
-                    lambda: gemm_triton_fp16(x_fp16, W_fp16), M, N, K)
 
             else:
                 continue
