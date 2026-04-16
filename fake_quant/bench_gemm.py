@@ -163,12 +163,19 @@ def _real_quant_single_group_high(q_x_raw, zero_x, s_x, q_w, s_w):
 
 
 def gemm_real_quant(act_quant_main, act_quant_high,
-                    weight_int_main, weight_int_high):
+                    weight_int_main, weight_int_high,
+                    column_order=None):
     """Quantization accuracy baseline — fp32 simulation of exact INT GEMM formula.
 
-    Uses the SAME formula as the INT TC kernel (shift-128 + bias for high group),
-    but computes matmul in fp32 instead of INT8/INT4 tensor core.
+    Uses the SAME formula as the INT TC kernel (shift-8/shift-128 + bias),
+    but computes matmul in fp32 instead of INT4/INT8 tensor core.
     If the INT kernel is implemented correctly, its output should match this exactly.
+
+    For per-group layers with column_order (o_proj):
+        Activation is quantized in original K space (per-group).
+        Weight is in rearranged K space (GPTQ).
+        We dequant activation per-group, flatten to original K, apply column_order,
+        then do one matmul with the rearranged weight.
     """
     q_w_m = weight_int_main['q_int'].cuda().float()
     s_w_m = weight_int_main['scale'].cuda().float()
@@ -218,23 +225,19 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 
     else:
         # === Per-group (o_proj) ===
+        # Activation is quantized per-group in ORIGINAL K space.
+        # Weight is in REARRANGED K space (GPTQ's rearrange_columns).
+        # Strategy: dequant activation per-group back to fp32 in original K,
+        # then apply column_order to rearranged space, then matmul with weight.
         batch, seq, ngroups, group_k_m = q_x_m_raw.shape
         M = batch * seq
 
-        q_x_m_flat = q_x_m_raw.reshape(M, ngroups, group_k_m)
-        s_x_m_flat = s_x_m.reshape(M, ngroups, 1)
-        z_x_m_flat = z_x_m.reshape(M, ngroups, 1) if z_x_m.dim() > 3 else z_x_m.reshape(M, -1, 1)
-        q_w_m_grouped = q_w_m.reshape(N, ngroups, group_k_m)
+        # Dequant main activation: scale * (q_int - zero) per group
+        x_dq_m = s_x_m * (q_x_m_raw - z_x_m)  # (batch, seq, ngroups, group_k_m)
+        x_dq_m_flat = x_dq_m.reshape(batch, seq, -1)  # (batch, seq, K_main_orig)
 
-        y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-        for g in range(ngroups):
-            q_x_g = q_x_m_flat[:, g, :].contiguous()
-            q_w_g = q_w_m_grouped[:, g, :].contiguous()
-            s_x_g = s_x_m_flat[:, g, :]  # (M, 1)
-            z_x_g = z_x_m_flat[:, g, :]  # (M, 1)
-            y += _real_quant_single_group_main(q_x_g, z_x_g, s_x_g, q_w_g, s_w_m)
-
-        # High group
+        # Dequant high activation
+        x_dq_h_flat = torch.zeros(batch, seq, 0, device='cuda', dtype=torch.float32)
         if act_quant_high is not None and q_w_h is not None:
             q_x_h_raw = act_quant_high['q_int'].cuda().float()
             s_x_h = act_quant_high['scale'].cuda().float()
@@ -244,18 +247,22 @@ def gemm_real_quant(act_quant_main, act_quant_high,
             else:
                 z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
 
-            group_k_h = q_x_h_raw.shape[-1]
-            q_x_h_flat = q_x_h_raw.reshape(M, ngroups, group_k_h)
-            s_x_h_flat = s_x_h.reshape(M, ngroups, 1)
-            z_x_h_flat = z_x_h.reshape(M, ngroups, 1) if z_x_h.dim() > 3 else z_x_h.reshape(M, -1, 1)
-            q_w_h_grouped = q_w_h.reshape(N, ngroups, group_k_h)
+            x_dq_h = s_x_h * (q_x_h_raw - z_x_h)  # (batch, seq, ngroups, group_k_h)
+            x_dq_h_flat = x_dq_h.reshape(batch, seq, -1)  # (batch, seq, K_high_orig)
 
-            for g in range(ngroups):
-                q_x_g = q_x_h_flat[:, g, :].contiguous()
-                q_w_g = q_w_h_grouped[:, g, :].contiguous()
-                s_x_g = s_x_h_flat[:, g, :]
-                z_x_g = z_x_h_flat[:, g, :]
-                y += _real_quant_single_group_high(q_x_g, z_x_g, s_x_g, q_w_g, s_w_h)
+        # Concat in original K space: [main | high]
+        # NOTE: original space groups are interleaved: [g0_main, g1_main, ..., g0_high, g1_high, ...]
+        # But quantizer splits: x_m = x[..., low:high_start], x_h = x[..., high_start:]
+        # So flat layout is already [all_main | all_high] in original space
+        x_dq = torch.cat([x_dq_m_flat, x_dq_h_flat], dim=-1)  # (batch, seq, K)
+
+        # Apply column_order to map from original → rearranged K space
+        if column_order is not None:
+            x_dq = x_dq[..., column_order]
+
+        # Dequant weight and do matmul in rearranged space
+        W_dq = torch.cat([s_w_m * q_w_m, s_w_h * q_w_h], dim=1) if q_w_h is not None else s_w_m * q_w_m
+        y = x_dq.reshape(M, -1) @ W_dq.T
 
         return y.half().reshape(batch, seq, N)
 
@@ -367,9 +374,9 @@ def bench_single_layer(layer_dir, bs_key):
                     results[test_name] = result
                     continue
 
-                y = gemm_real_quant(act_main, act_high, w_main, w_high)
+                y = gemm_real_quant(act_main, act_high, w_main, w_high, column_order=col_order)
                 perf = compute_perf_metrics(
-                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high),
+                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high, column_order=col_order),
                     M, N, K, warmup=5, repeat=20)
 
             else:

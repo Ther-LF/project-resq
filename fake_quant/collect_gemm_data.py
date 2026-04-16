@@ -176,20 +176,24 @@ class GEMMDataCollector:
             # Apply rotation (same as forward does)
             x_rotated = wrapper._apply_rotation(x.clone())
 
-            # Apply column reorder if present (o_proj)
+            # Compute FP16 baseline: use column_order if present (o_proj)
             # Weight W is already rearranged by rearrange_columns(),
-            # so we must reorder x to match before computing baselines.
+            # so we reorder x to match for the FP16 baseline matmul only.
+            # Activation quantization stays in the original (un-reordered) space
+            # because forward() quantizes BEFORE applying column_order.
             col_order = getattr(wrapper, '_column_order', None)
             if col_order is not None:
-                x_rotated = x_rotated[..., col_order]
+                x_for_baseline = x_rotated[..., col_order]
+            else:
+                x_for_baseline = x_rotated
 
-            # Compute FP16 baseline: x_rotated @ W.T (no quantization)
+            # Compute FP16 baseline: x @ W.T (no quantization)
             W = wrapper.module.weight.data
-            x_flat = x_rotated.reshape(-1, x_rotated.shape[-1])
+            x_flat = x_for_baseline.reshape(-1, x_for_baseline.shape[-1])
             output_fp16_baseline = (x_flat.float() @ W.float().T).half()
             output_fp16_baseline = output_fp16_baseline.reshape(*x_rotated.shape[:-1], -1)
 
-            # Compute activation quantization params
+            # Compute activation quantization params (in original un-reordered space)
             wrapper.quantizer.find_params(x_rotated)
 
             # Handle groupsize reshaping for quantize
