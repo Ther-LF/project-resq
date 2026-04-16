@@ -163,13 +163,12 @@ def _real_quant_single_group_high(q_x_raw, zero_x, s_x, q_w, s_w):
 
 
 def gemm_real_quant(act_quant_main, act_quant_high,
-                    weight_int_main, weight_int_high,
-                    column_order=None, W_fp16=None):
+                    weight_int_main, weight_int_high):
     """Quantization accuracy baseline — fp32 simulation of exact INT GEMM formula.
 
     Per-token layers: uses shift-8/shift-128 + bias formula (same as INT TC kernel).
-    Per-group layers (o_proj): dequants activation per-group, then does a single
-    matmul with W_fp16 (since weight_int layout is complex with column reorder).
+    Per-group layers (o_proj): per-group shift+bias INT formula, accumulated across groups.
+    Both paths use the same shift+bias trick that the real CUTLASS kernel will use.
     """
     q_w_m = weight_int_main['q_int'].cuda().float()
     s_w_m = weight_int_main['scale'].cuda().float()
@@ -219,16 +218,45 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 
     else:
         # === Per-group (o_proj) ===
-        # Activation is quantized per-group. Each group has [main|high] interleaved.
-        # Dequant activation per-group, then matmul with W_fp16 directly.
+        # Each group has its own activation scale/zero. Use shift+bias INT formula
+        # per group, then accumulate.
+        #
+        # Weight layout (contiguous after column_order):
+        #   q_w_m: (N, ngroups*group_k_m)  e.g. (2048, 1792) for 32 groups × 56
+        #   q_w_h: (N, ngroups*group_k_h)  e.g. (2048, 256)  for 32 groups × 8
+        # Activation layout (per-group):
+        #   q_x_m_raw: (batch, seq, ngroups, group_k_m)  e.g. (..., 32, 56)
+        #   q_x_h_raw: (batch, seq, ngroups, group_k_h)  e.g. (..., 32, 8)
+        #
+        # For each group g:
+        #   y += s_x_m_g * s_w_m * (shift_main(q_x_m_g) @ q_w_m_g^T + bias_m_g)
+        #   y += s_x_h_g * s_w_h * (shift_high(q_x_h_g) @ q_w_h_g^T + bias_h_g)
+
         batch, seq, ngroups, group_k_m = q_x_m_raw.shape
         M = batch * seq
 
-        # Dequant main: scale * (q_int - zero) per group
-        x_dq_m = s_x_m * (q_x_m_raw - z_x_m)  # (batch, seq, ngroups, 56)
+        # Flatten activation batch dims
+        q_x_m_flat = q_x_m_raw.reshape(M, ngroups, group_k_m)  # (M, G, 56)
+        s_x_m_flat = s_x_m.reshape(M, ngroups, -1)              # (M, G, 1)
+        z_x_m_flat = z_x_m.reshape(M, ngroups, -1)              # (M, G, 1)
 
-        # Dequant high and interleave
-        if act_quant_high is not None:
+        y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
+
+        # Main groups: shift-8 + bias
+        for g in range(ngroups):
+            q_x_g = q_x_m_flat[:, g, :]       # (M, 56)
+            s_x_g = s_x_m_flat[:, g, :]        # (M, 1)
+            z_x_g = z_x_m_flat[:, g, :]        # (M, 1)
+            q_w_g = q_w_m[:, g*group_k_m:(g+1)*group_k_m]  # (N, 56)
+
+            q_shifted = q_x_g - 8.0
+            w_colsum = q_w_g.sum(dim=1, keepdim=True).T     # (1, N)
+            bias = (8.0 - z_x_g) @ w_colsum                 # (M, N)
+            y_int = q_shifted @ q_w_g.T                      # (M, N)
+            y += s_x_g * s_w_m.flatten().unsqueeze(0) * (y_int + bias)
+
+        # High groups: shift-128 + bias
+        if act_quant_high is not None and q_w_h is not None:
             q_x_h_raw = act_quant_high['q_int'].cuda().float()
             s_x_h = act_quant_high['scale'].cuda().float()
             z_x_h = act_quant_high.get('zero', None)
@@ -237,19 +265,22 @@ def gemm_real_quant(act_quant_main, act_quant_high,
             else:
                 z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
 
-            x_dq_h = s_x_h * (q_x_h_raw - z_x_h)  # (batch, seq, ngroups, 8)
-            x_dq = torch.cat([x_dq_m, x_dq_h], dim=-1)  # (batch, seq, ngroups, 64)
-        else:
-            x_dq = x_dq_m
+            group_k_h = q_x_h_raw.shape[-1]
+            q_x_h_flat = q_x_h_raw.reshape(M, ngroups, group_k_h)
+            s_x_h_flat = s_x_h.reshape(M, ngroups, -1)
+            z_x_h_flat = z_x_h.reshape(M, ngroups, -1)
 
-        x_dq = x_dq.reshape(M, -1)  # (M, K) in original interleaved space
+            for g in range(ngroups):
+                q_x_g = q_x_h_flat[:, g, :]       # (M, 8)
+                s_x_g = s_x_h_flat[:, g, :]        # (M, 1)
+                z_x_g = z_x_h_flat[:, g, :]        # (M, 1)
+                q_w_g = q_w_h[:, g*group_k_h:(g+1)*group_k_h]  # (N, 8)
 
-        # Use W_fp16 for matmul (activation and W_fp16 are in the same K space)
-        assert W_fp16 is not None, "Per-group (o_proj) requires W_fp16 for matmul"
-        y = x_dq @ W_fp16.float().T
-
-        return y.half().reshape(batch, seq, N)
-        y = x_dq.reshape(M, -1) @ W_dq.T
+                q_shifted = q_x_g - 128.0
+                w_colsum = q_w_g.sum(dim=1, keepdim=True).T     # (1, N)
+                bias = (128.0 - z_x_g) @ w_colsum               # (M, N)
+                y_int = q_shifted @ q_w_g.T                      # (M, N)
+                y += s_x_g * s_w_h.flatten().unsqueeze(0) * (y_int + bias)
 
         return y.half().reshape(batch, seq, N)
 
@@ -320,8 +351,7 @@ def bench_single_layer(layer_dir, bs_key):
     meta = data.get('metadata', {})
     N, K = W_fp16.shape
 
-    # Keep original W_fp16 for per-group real quant (activation is in original K space)
-    W_fp16_orig = W_fp16.clone()
+    # Keep original W_fp16 before column reorder (for reference, not used in real quant)
 
     # Apply column reorder if present (o_proj).
     # FP16 baseline needs reordered data since x_reord @ W_reord^T = x_orig @ W_orig^T.
@@ -362,11 +392,9 @@ def bench_single_layer(layer_dir, bs_key):
                     results[test_name] = result
                     continue
 
-                y = gemm_real_quant(act_main, act_high, w_main, w_high,
-                                    column_order=col_order, W_fp16=W_fp16_orig)
+                y = gemm_real_quant(act_main, act_high, w_main, w_high)
                 perf = compute_perf_metrics(
-                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high,
-                                           column_order=col_order, W_fp16=W_fp16_orig),
+                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high),
                     M, N, K, warmup=5, repeat=20)
 
             else:
