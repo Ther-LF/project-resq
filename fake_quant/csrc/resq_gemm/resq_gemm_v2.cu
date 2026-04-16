@@ -1,11 +1,15 @@
 /*
- * ResQ GEMM Kernels — CUTLASS 3.x Hopper (SM90)
+ * ResQ GEMM Kernel — CUTLASS 3.x Hopper (SM90a)
  *
- * Based on CUTLASS example 55 (hopper_mixed_dtype_gemm).
- * Attempts same-type INT8×INT8 with group-wise activation scale.
+ * Pure INT8×INT8 → INT32 accumulator GEMM using standard CollectiveBuilder.
+ * No MixedInput (which converts to float). Uses real INT8 Tensor Core.
  *
- * Step 1: Minimal test — does CollectiveBuilder accept tuple<int8_t, float> for
- *         same-type GEMM with group-wise scale?
+ * Semantics:
+ *   D[m,n] = A_int8[m,:] @ B_int8[n,:]^T   (INT32 accumulation)
+ *   Output is float32 (converted from int32 in epilogue).
+ *
+ * Scale/bias/shift are handled in Python post-processing for now.
+ * The kernel is intentionally minimal: just INT8 GEMM with correct TC usage.
  */
 
 #include <cuda_runtime.h>
@@ -27,25 +31,20 @@ using namespace cute;
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
 
 // ============================================================
-// Type definitions
+// Type definitions — pure INT8×INT8 → INT32
 // ============================================================
 
-// A = activation: int8, RowMajor — the "wide" type
+// A = activation: int8, RowMajor
 using ElementA    = int8_t;
 using LayoutA     = cutlass::layout::RowMajor;
 constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // 16
 
 // B = weight: int8, ColumnMajor (stored as RowMajor N×K, passed as ColMajor K×N)
-// B is the operand that carries the group-wise scale
 using ElementB    = int8_t;
 using LayoutB     = cutlass::layout::ColumnMajor;
 constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // 16
 
-// Scale and zero types for B's group-wise dequant
-using ElementScale = float;
-using ElementZero  = float;
-
-// Output
+// Output: float32 (epilogue converts int32 accumulator to float)
 using ElementC     = float;
 using LayoutC      = cutlass::layout::RowMajor;
 constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;  // 4
@@ -54,30 +53,25 @@ using ElementD     = float;
 using LayoutD      = LayoutC;
 constexpr int AlignmentD = AlignmentC;
 
-// Accumulator and compute
+// INT32 accumulator — this is the whole point: use INT8 TC with INT32 acc
 using ElementAccumulator = int32_t;
 using ElementCompute     = float;
 
 // Architecture
-using ArchTag       = cutlass::arch::Sm90;
+using ArchTag        = cutlass::arch::Sm90;
 using OperatorClass  = cutlass::arch::OpClassTensorOp;
 
-// Tile shapes — TileShapeK=64 to support group_size=64 (padded from 56)
-constexpr int TileShapeK = 64;
-using TileShape    = Shape<_128, _128, cute::Int<TileShapeK>>;
+// Tile shape — TileShapeK=128 is typical for INT8 GEMM
+using TileShape    = Shape<_128, _128, _128>;
 using ClusterShape = Shape<_1, _1, _1>;
 
-// Schedules
-using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecializedCooperativeMixedInput;
+// Standard schedules (NOT MixedInput)
+using KernelSchedule   = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
 using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
 using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
-// For the swap trick (same as example 55)
-using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
-using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
-
 // ============================================================
-// Epilogue: simple alpha*acc (no bias for now)
+// Epilogue: convert INT32 acc to float output, alpha=1 beta=0
 // ============================================================
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -85,24 +79,19 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     TileShape, ClusterShape,
     EpilogueTileType,
     ElementAccumulator, ElementCompute,
-    // Transpose C/D layouts due to swap trick
-    ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type, AlignmentC,
-    ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type, AlignmentD,
+    ElementC, LayoutC, AlignmentC,
+    ElementD, LayoutD, AlignmentD,
     EpilogueSchedule
 >::CollectiveOp;
 
 // ============================================================
-// Mainloop: INT8 × (INT8 + Scale) with group-wise dequant
+// Mainloop: standard INT8×INT8 → INT32
 // ============================================================
-// Following example 55: B is the "narrow" type with scale.
-// We swap A and B so that B (with scale) goes through register file.
-// tuple<ElementB, ElementScale> tells the builder to do group-wise dequant on B.
 
-using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
-    // Swapped: B (with scale) first, A second
-    cute::tuple<ElementB, ElementScale>, LayoutB_Transpose, AlignmentB,
-    ElementA, LayoutA_Transpose, AlignmentA,
+    ElementA, LayoutA, AlignmentA,
+    ElementB, LayoutB, AlignmentB,
     ElementAccumulator,
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
@@ -113,7 +102,7 @@ using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::Collecti
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int,int>,
-    CollectiveMainloopScaleOnly,
+    CollectiveMainloop,
     CollectiveEpilogue
 >;
 
@@ -127,9 +116,6 @@ using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
 using StrideC = typename GemmKernel::StrideC;
 using StrideD = typename GemmKernel::StrideD;
 
-// Scale stride: must match what the collective mainloop expects
-using StrideS = typename CollectiveMainloopScaleOnly::StrideScale;
-
 #define CUTLASS_CHECK(status)                                         \
   {                                                                   \
     cutlass::Status error = status;                                   \
@@ -142,31 +128,25 @@ using StrideS = typename CollectiveMainloopScaleOnly::StrideScale;
   }
 
 // ============================================================
-// Run function
+// Run: pure INT8 GEMM, D_float = int32_to_float(A_int8 @ B_int8^T)
 // ============================================================
 
-void run_gemm_s8s8_grouped_scale(
-    int M, int N, int K, int group_size,
-    const int8_t* A,       // (M, K) activation, RowMajor
-    const int8_t* B,       // (N, K) weight, RowMajor (passed as ColMajor)
-    const float* scale_B,  // (N, scale_k) per-group weight scale, scale_k = ceil(K/group_size)
-    float* D,              // (M, N) output
+void run_gemm_s8s8(
+    int M, int N, int K,
+    const int8_t* A,   // (M, K) RowMajor
+    const int8_t* B,   // (N, K) RowMajor (passed as ColMajor K×N)
+    float* D,          // (M, N) RowMajor output
     cudaStream_t stream = nullptr)
 {
-    int scale_k = (K + group_size - 1) / group_size;
-
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-    // Transpose strides for C/D due to swap
-    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(N, M, 1));
-    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(N, M, 1));
-    auto stride_S = cutlass::make_cute_packed_stride(StrideS{}, cute::make_shape(N, scale_k, 1));
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
 
-    // Arguments: swapped problem shape (N, M, K) due to explicit swap
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
-        {N, M, K, 1},  // problem shape: swapped M and N
-        {B, stride_B, A, stride_A, scale_B, stride_S, group_size},
+        {M, N, K, 1},
+        {A, stride_A, B, stride_B},
         {{1.0f, 0.0f}, nullptr, stride_C, D, stride_D}
     };
 
@@ -186,8 +166,7 @@ void run_gemm_s8s8_grouped_scale(
 }
 
 #else
-// Fallback for non-SM90
-void run_gemm_s8s8_grouped_scale(int, int, int, int, const int8_t*, const int8_t*, const float*, float*, cudaStream_t) {
+void run_gemm_s8s8(int, int, int, const int8_t*, const int8_t*, float*, cudaStream_t) {
     throw std::runtime_error("SM90 not supported");
 }
 #endif
