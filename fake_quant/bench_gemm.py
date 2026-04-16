@@ -164,18 +164,12 @@ def _real_quant_single_group_high(q_x_raw, zero_x, s_x, q_w, s_w):
 
 def gemm_real_quant(act_quant_main, act_quant_high,
                     weight_int_main, weight_int_high,
-                    column_order=None):
+                    column_order=None, W_fp16=None):
     """Quantization accuracy baseline — fp32 simulation of exact INT GEMM formula.
 
-    Uses the SAME formula as the INT TC kernel (shift-8/shift-128 + bias),
-    but computes matmul in fp32 instead of INT4/INT8 tensor core.
-    If the INT kernel is implemented correctly, its output should match this exactly.
-
-    For per-group layers with column_order (o_proj):
-        Activation is quantized in original K space (per-group).
-        Weight is in rearranged K space (GPTQ).
-        We dequant activation per-group, flatten to original K, apply column_order,
-        then do one matmul with the rearranged weight.
+    Per-token layers: uses shift-8/shift-128 + bias formula (same as INT TC kernel).
+    Per-group layers (o_proj): dequants activation per-group, then does a single
+    matmul with W_fp16 (since weight_int layout is complex with column reorder).
     """
     q_w_m = weight_int_main['q_int'].cuda().float()
     s_w_m = weight_int_main['scale'].cuda().float()
@@ -225,18 +219,16 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 
     else:
         # === Per-group (o_proj) ===
-        # Both activation and weight are in the SAME K space (original or rearranged).
-        # Activation per-group layout: [g0_main(56)|g0_high(8)|g1_main(56)|g1_high(8)|...]
-        # We dequant per-group, reconstruct the interleaved layout, then matmul with
-        # the full dequanted weight (also reconstructed in the same interleaved layout).
+        # Activation is quantized per-group. Each group has [main|high] interleaved.
+        # Dequant activation per-group, then matmul with W_fp16 directly.
         batch, seq, ngroups, group_k_m = q_x_m_raw.shape
         M = batch * seq
 
-        # Dequant main activation: scale * (q_int - zero) per group
-        x_dq_m = s_x_m * (q_x_m_raw - z_x_m)  # (batch, seq, ngroups, group_k_m=56)
+        # Dequant main: scale * (q_int - zero) per group
+        x_dq_m = s_x_m * (q_x_m_raw - z_x_m)  # (batch, seq, ngroups, 56)
 
-        # Dequant high activation and interleave with main
-        if act_quant_high is not None and q_w_h is not None:
+        # Dequant high and interleave
+        if act_quant_high is not None:
             q_x_h_raw = act_quant_high['q_int'].cuda().float()
             s_x_h = act_quant_high['scale'].cuda().float()
             z_x_h = act_quant_high.get('zero', None)
@@ -245,26 +237,16 @@ def gemm_real_quant(act_quant_main, act_quant_high,
             else:
                 z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
 
-            x_dq_h = s_x_h * (q_x_h_raw - z_x_h)  # (batch, seq, ngroups, group_k_h=8)
-
-            # Interleave: [g0_main(56)|g0_high(8)|g1_main(56)|g1_high(8)|...]
+            x_dq_h = s_x_h * (q_x_h_raw - z_x_h)  # (batch, seq, ngroups, 8)
             x_dq = torch.cat([x_dq_m, x_dq_h], dim=-1)  # (batch, seq, ngroups, 64)
-
-            # Reconstruct weight in same interleaved layout
-            group_k_h = q_x_h_raw.shape[-1]
-            q_w_m_g = q_w_m.reshape(N, ngroups, group_k_m)  # (N, 32, 56)
-            q_w_h_g = q_w_h.reshape(N, ngroups, group_k_h)  # (N, 32, 8)
-            W_dq_g = torch.cat([
-                s_w_m.unsqueeze(-1) * q_w_m_g,  # (N,1,1) * (N,32,56) → (N,32,56)
-                s_w_h.unsqueeze(-1) * q_w_h_g,  # (N,1,1) * (N,32,8)  → (N,32,8)
-            ], dim=-1)  # (N, 32, 64)
-            W_dq = W_dq_g.reshape(N, -1)  # (N, 2048) interleaved
         else:
             x_dq = x_dq_m
-            W_dq = (s_w_m * q_w_m).reshape(N, -1)
 
-        x_dq = x_dq.reshape(M, -1)  # (M, K)
-        y = x_dq @ W_dq.T
+        x_dq = x_dq.reshape(M, -1)  # (M, K) in original interleaved space
+
+        # Use W_fp16 for matmul (activation and W_fp16 are in the same K space)
+        assert W_fp16 is not None, "Per-group (o_proj) requires W_fp16 for matmul"
+        y = x_dq @ W_fp16.float().T
 
         return y.half().reshape(batch, seq, N)
         y = x_dq.reshape(M, -1) @ W_dq.T
@@ -379,9 +361,11 @@ def bench_single_layer(layer_dir, bs_key):
                     results[test_name] = result
                     continue
 
-                y = gemm_real_quant(act_main, act_high, w_main, w_high, column_order=col_order)
+                y = gemm_real_quant(act_main, act_high, w_main, w_high,
+                                    column_order=col_order, W_fp16=W_fp16)
                 perf = compute_perf_metrics(
-                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high, column_order=col_order),
+                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high,
+                                           column_order=col_order, W_fp16=W_fp16),
                     M, N, K, warmup=5, repeat=20)
 
             else:
