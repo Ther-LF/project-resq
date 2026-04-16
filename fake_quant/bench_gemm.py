@@ -320,10 +320,11 @@ def bench_single_layer(layer_dir, bs_key):
     meta = data.get('metadata', {})
     N, K = W_fp16.shape
 
+    # Keep original W_fp16 for per-group real quant (activation is in original K space)
+    W_fp16_orig = W_fp16.clone()
+
     # Apply column reorder if present (o_proj).
-    # Quant data (act_quant_*, weight_int_*) are stored in reordered K order.
-    # FP16 data (input_fp16, weight_fp16) are in original order.
-    # Reorder FP16 data to match, so FP16 baseline is a fair comparison.
+    # FP16 baseline needs reordered data since x_reord @ W_reord^T = x_orig @ W_orig^T.
     col_order = data.get('column_order', None)
     if col_order is not None:
         x_fp16 = x_fp16[..., col_order]
@@ -362,10 +363,10 @@ def bench_single_layer(layer_dir, bs_key):
                     continue
 
                 y = gemm_real_quant(act_main, act_high, w_main, w_high,
-                                    column_order=col_order, W_fp16=W_fp16)
+                                    column_order=col_order, W_fp16=W_fp16_orig)
                 perf = compute_perf_metrics(
                     lambda: gemm_real_quant(act_main, act_high, w_main, w_high,
-                                           column_order=col_order, W_fp16=W_fp16),
+                                           column_order=col_order, W_fp16=W_fp16_orig),
                     M, N, K, warmup=5, repeat=20)
 
             else:
