@@ -4,12 +4,16 @@
  * Grouped INT8×INT8 → INT32 accumulator GEMM using PtrArray schedule.
  * Each group g computes: D_g[M,N] = A_g[M,K] @ B_g[N,K]^T
  *
- * All metadata (problem_sizes, pointer arrays, strides) must be
- * pre-allocated on device by the caller. No cudaMalloc/cudaMemcpy here.
+ * All metadata (problem_sizes, pointer arrays, strides) built on device
+ * via torch tensors in launch_grouped_gemm_s8s8. No raw cudaMalloc/cudaMemcpy.
  */
 
 #include <cuda_runtime.h>
 #include <iostream>
+#include <vector>
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -175,6 +179,97 @@ StrideD make_stride_d(int M, int N) {
     return cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
 }
 
+// ============================================================
+// PyTorch entry point: build device metadata + launch
+//
+// A_groups: (G, M, K) int8 contiguous on CUDA
+// B_groups: (G, N, K) int8 contiguous on CUDA
+// Returns:  (G, M, N) float32
+// ============================================================
+
+torch::Tensor launch_grouped_gemm_s8s8(torch::Tensor A_groups, torch::Tensor B_groups)
+{
+    using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
+
+    const int G = A_groups.size(0);
+    const int M = A_groups.size(1);
+    const int K = A_groups.size(2);
+    const int N = B_groups.size(1);
+    auto device = A_groups.device();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // Output
+    auto D = torch::empty({G, M, N}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+
+    // 1. Problem sizes — host vector + device copy via torch
+    std::vector<UnderlyingProblemShape> sizes_host(G, make_shape(M, N, K));
+    auto sizes_dev = torch::from_blob(
+        sizes_host.data(), {(int64_t)(G * sizeof(UnderlyingProblemShape))}, torch::kUInt8
+    ).to(device);
+
+    // 2. Pointer arrays — host vectors + device copy
+    const int8_t* A_base = reinterpret_cast<const int8_t*>(A_groups.data_ptr());
+    const int8_t* B_base = reinterpret_cast<const int8_t*>(B_groups.data_ptr());
+    float* D_base = reinterpret_cast<float*>(D.data_ptr());
+
+    std::vector<const int8_t*> A_ptrs_h(G), B_ptrs_h(G);
+    std::vector<float*> D_ptrs_h(G);
+    for (int g = 0; g < G; g++) {
+        A_ptrs_h[g] = A_base + (size_t)g * M * K;
+        B_ptrs_h[g] = B_base + (size_t)g * N * K;
+        D_ptrs_h[g] = D_base + (size_t)g * M * N;
+    }
+
+    auto A_ptrs_dev = torch::from_blob(
+        A_ptrs_h.data(), {(int64_t)(G * sizeof(void*))}, torch::kUInt8).to(device);
+    auto B_ptrs_dev = torch::from_blob(
+        B_ptrs_h.data(), {(int64_t)(G * sizeof(void*))}, torch::kUInt8).to(device);
+    auto D_ptrs_dev = torch::from_blob(
+        D_ptrs_h.data(), {(int64_t)(G * sizeof(void*))}, torch::kUInt8).to(device);
+
+    // 3. Strides — all identical
+    auto sa = make_stride_a(M, K);
+    auto sb = make_stride_b(N, K);
+    auto sc = make_stride_c(M, N);
+    auto sd = make_stride_d(M, N);
+
+    std::vector<StrideA> sa_h(G, sa);
+    std::vector<StrideB> sb_h(G, sb);
+    std::vector<StrideC> sc_h(G, sc);
+    std::vector<StrideD> sd_h(G, sd);
+
+    auto sa_dev = torch::from_blob(sa_h.data(), {(int64_t)(G * sizeof(StrideA))}, torch::kUInt8).to(device);
+    auto sb_dev = torch::from_blob(sb_h.data(), {(int64_t)(G * sizeof(StrideB))}, torch::kUInt8).to(device);
+    auto sc_dev = torch::from_blob(sc_h.data(), {(int64_t)(G * sizeof(StrideC))}, torch::kUInt8).to(device);
+    auto sd_dev = torch::from_blob(sd_h.data(), {(int64_t)(G * sizeof(StrideD))}, torch::kUInt8).to(device);
+
+    // 4. Workspace
+    size_t ws_size = get_grouped_gemm_workspace_size(G, M, N, K);
+    torch::Tensor workspace;
+    void* ws_ptr = nullptr;
+    if (ws_size > 0) {
+        workspace = torch::empty({(int64_t)ws_size}, torch::TensorOptions().device(device).dtype(torch::kUInt8));
+        ws_ptr = workspace.data_ptr();
+    }
+
+    // 5. Launch — pure kernel, all data on device
+    run_grouped_gemm_s8s8(
+        G,
+        sizes_dev.data_ptr(),
+        sizes_host.data(),
+        reinterpret_cast<const int8_t**>(A_ptrs_dev.data_ptr()),
+        reinterpret_cast<StrideA*>(sa_dev.data_ptr()),
+        reinterpret_cast<const int8_t**>(B_ptrs_dev.data_ptr()),
+        reinterpret_cast<StrideB*>(sb_dev.data_ptr()),
+        reinterpret_cast<StrideC*>(sc_dev.data_ptr()),
+        reinterpret_cast<float**>(D_ptrs_dev.data_ptr()),
+        reinterpret_cast<StrideD*>(sd_dev.data_ptr()),
+        ws_ptr,
+        stream);
+
+    return D;
+}
+
 #else
 
 void run_grouped_gemm_s8s8(int, void*, void*, const int8_t**, void*,
@@ -182,5 +277,9 @@ void run_grouped_gemm_s8s8(int, void*, void*, const int8_t**, void*,
     throw std::runtime_error("SM90 not supported");
 }
 size_t get_grouped_gemm_workspace_size(int, int, int, int) { return 0; }
+
+torch::Tensor launch_grouped_gemm_s8s8(torch::Tensor, torch::Tensor) {
+    throw std::runtime_error("SM90 not supported");
+}
 
 #endif
