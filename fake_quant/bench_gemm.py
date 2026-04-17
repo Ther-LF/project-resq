@@ -367,6 +367,118 @@ def gemm_cutlass_int8(act_quant_main, act_quant_high,
     return y
 
 
+def _pad_k_to_multiple(t, multiple=16):
+    """Pad last dim of tensor to nearest multiple (for CUTLASS alignment)."""
+    K = t.shape[-1]
+    pad_k = (multiple - K % multiple) % multiple
+    if pad_k == 0:
+        return t
+    pad_shape = list(t.shape)
+    pad_shape[-1] = pad_k
+    return torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype, device=t.device)], dim=-1)
+
+
+def gemm_cutlass_int8_grouped(act_quant_main, act_quant_high,
+                               weight_int_main, weight_int_high):
+    """Baseline 3 grouped: CUTLASS INT8 TC grouped GEMM for per-group activation.
+
+    Single kernel launch for G groups using CUTLASS PtrArray schedule.
+    Each group: (M, K_g) × (N, K_g)^T → (M, N), post-process with per-group scale+bias.
+    """
+    if not HAS_CUTLASS:
+        raise RuntimeError("resq_gemm_v2 not available")
+
+    q_w_m = weight_int_main['q_int'].cuda()   # (N, G*K_g)
+    s_w_m = weight_int_main['scale'].cuda().float()  # (N, 1)
+
+    q_w_h = weight_int_high['q_int'].cuda() if weight_int_high else None
+    s_w_h = weight_int_high['scale'].cuda().float() if weight_int_high else None
+
+    # Activation: (batch, seq, G, K_g) with per-group scale (batch, seq, G, 1)
+    q_x_m_raw = act_quant_main['q_int'].cuda()      # (B, S, G, K_g)
+    s_x_m = act_quant_main['scale'].cuda().float()   # (B, S, G, 1)
+    z_x_m = act_quant_main.get('zero', None)
+    if z_x_m is not None:
+        z_x_m = z_x_m.cuda().float()
+    else:
+        z_x_m = torch.zeros_like(q_x_m_raw[..., :1]).float()
+
+    batch, seq, G, K_g = q_x_m_raw.shape
+    M = batch * seq
+    N = q_w_m.shape[0]
+
+    # Flatten batch dims
+    q_x_m_flat = q_x_m_raw.reshape(M, G, K_g)   # (M, G, K_g)
+    s_x_m_flat = s_x_m.reshape(M, G, 1)          # (M, G, 1)
+    z_x_m_flat = z_x_m.reshape(M, G, 1)          # (M, G, 1)
+
+    # === Main groups: shift-8, grouped CUTLASS ===
+    # Prepare A: (G, M, K_pad) int8 — shift and pad
+    q_x_shifted = (q_x_m_flat.float() - 8.0).to(torch.int8)  # (M, G, K_g)
+    q_x_shifted = q_x_shifted.permute(1, 0, 2).contiguous()   # (G, M, K_g)
+    q_x_shifted = _pad_k_to_multiple(q_x_shifted, 16)          # (G, M, K_pad)
+
+    # Prepare B: (G, N, K_pad) int8 — slice weight into groups and pad
+    q_w_m_int8 = q_w_m.to(torch.int8)
+    B_groups = []
+    for g in range(G):
+        B_g = q_w_m_int8[:, g*K_g:(g+1)*K_g]  # (N, K_g)
+        B_groups.append(B_g)
+    B_stacked = torch.stack(B_groups, dim=0).contiguous()  # (G, N, K_g)
+    B_stacked = _pad_k_to_multiple(B_stacked, 16)           # (G, N, K_pad)
+
+    # Single kernel launch: G independent (M, K_pad) × (N, K_pad)^T → (G, M, N)
+    D_m = resq_gemm_v2.grouped_gemm_s8s8(q_x_shifted, B_stacked)  # (G, M, N)
+
+    # Post-process: per-group bias and scale
+    # bias_g = (8 - z_x_g) * colsum(q_w_g) for each group
+    y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
+    s_w_m_flat = s_w_m.flatten().unsqueeze(0)  # (1, N)
+
+    for g in range(G):
+        q_w_g = q_w_m_int8[:, g*K_g:(g+1)*K_g].float()  # (N, K_g)
+        w_colsum = q_w_g.sum(dim=1, keepdim=True).T       # (1, N)
+        bias_g = (8.0 - z_x_m_flat[:, g, :]) @ w_colsum   # (M, N)
+        y += s_x_m_flat[:, g, :] * s_w_m_flat * (D_m[g] + bias_g)
+
+    # === High groups: shift-128, grouped CUTLASS ===
+    if act_quant_high is not None and q_w_h is not None:
+        q_x_h_raw = act_quant_high['q_int'].cuda()
+        s_x_h = act_quant_high['scale'].cuda().float()
+        z_x_h = act_quant_high.get('zero', None)
+        if z_x_h is not None:
+            z_x_h = z_x_h.cuda().float()
+        else:
+            z_x_h = torch.zeros_like(q_x_h_raw[..., :1]).float()
+
+        K_h = q_x_h_raw.shape[-1]
+        q_x_h_flat = q_x_h_raw.reshape(M, G, K_h)
+        s_x_h_flat = s_x_h.reshape(M, G, 1)
+        z_x_h_flat = z_x_h.reshape(M, G, 1)
+
+        q_x_h_shifted = (q_x_h_flat.float() - 128.0).to(torch.int8)
+        q_x_h_shifted = q_x_h_shifted.permute(1, 0, 2).contiguous()
+        q_x_h_shifted = _pad_k_to_multiple(q_x_h_shifted, 16)
+
+        q_w_h_int8 = q_w_h.to(torch.int8)
+        B_h_groups = []
+        for g in range(G):
+            B_h_groups.append(q_w_h_int8[:, g*K_h:(g+1)*K_h])
+        B_h_stacked = torch.stack(B_h_groups, dim=0).contiguous()
+        B_h_stacked = _pad_k_to_multiple(B_h_stacked, 16)
+
+        D_h = resq_gemm_v2.grouped_gemm_s8s8(q_x_h_shifted, B_h_stacked)
+
+        s_w_h_flat = s_w_h.flatten().unsqueeze(0)
+        for g in range(G):
+            q_w_h_g = q_w_h_int8[:, g*K_h:(g+1)*K_h].float()
+            w_colsum_h = q_w_h_g.sum(dim=1, keepdim=True).T
+            bias_h_g = (128.0 - z_x_h_flat[:, g, :]) @ w_colsum_h
+            y += s_x_h_flat[:, g, :] * s_w_h_flat * (D_h[g] + bias_h_g)
+
+    return y.half().reshape(batch, seq, N)
+
+
 
 
 ALL_TESTS = [
@@ -487,14 +599,16 @@ def bench_single_layer(layer_dir, bs_key):
                 # Per-token only (skip grouped/o_proj for now)
                 s_x_test = act_main['scale'].cuda().float()
                 if s_x_test.dim() > 3:
-                    result['error'] = 'grouped (o_proj) not supported yet'
-                    results[test_name] = result
-                    continue
-
-                y = gemm_cutlass_int8(act_main, act_high, w_main, w_high)
-                perf = compute_perf_metrics(
-                    lambda: gemm_cutlass_int8(act_main, act_high, w_main, w_high),
-                    M, N, K, warmup=10, repeat=100)
+                    # Grouped (o_proj): use grouped GEMM
+                    y = gemm_cutlass_int8_grouped(act_main, act_high, w_main, w_high)
+                    perf = compute_perf_metrics(
+                        lambda: gemm_cutlass_int8_grouped(act_main, act_high, w_main, w_high),
+                        M, N, K, warmup=5, repeat=20)
+                else:
+                    y = gemm_cutlass_int8(act_main, act_high, w_main, w_high)
+                    perf = compute_perf_metrics(
+                        lambda: gemm_cutlass_int8(act_main, act_high, w_main, w_high),
+                        M, N, K, warmup=10, repeat=100)
 
             else:
                 continue
