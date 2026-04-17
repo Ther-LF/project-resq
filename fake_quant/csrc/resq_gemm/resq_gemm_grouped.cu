@@ -107,12 +107,12 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
 // ============================================================
-// Stride types
+// Stride types — use Internal variants for grouped mode
 // ============================================================
-using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
-using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
-using StrideC = typename GemmKernel::StrideC;
-using StrideD = typename GemmKernel::StrideD;
+using StrideA = typename GemmKernel::InternalStrideA;
+using StrideB = typename GemmKernel::InternalStrideB;
+using StrideC = typename GemmKernel::InternalStrideC;
+using StrideD = typename GemmKernel::InternalStrideD;
 
 #define CUTLASS_CHECK(status)                                         \
   {                                                                   \
@@ -144,10 +144,10 @@ void run_grouped_gemm_s8s8(
     }
 
     // Build strides (all identical since same M,N,K)
-    auto stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, 1));
-    auto stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, 1));
-    auto stride_c = cutlass::make_cute_packed_stride(StrideC{}, make_shape(M, N, 1));
-    auto stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(M, N, 1));
+    auto stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    auto stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    auto stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    auto stride_d = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
 
     std::vector<StrideA> strides_A_host(ngroups, stride_a);
     std::vector<StrideB> strides_B_host(ngroups, stride_b);
