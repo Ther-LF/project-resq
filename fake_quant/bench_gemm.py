@@ -18,6 +18,10 @@ import torch.nn.functional as F
 
 # CUTLASS INT8 TC kernel
 try:
+    import sys as _sys
+    _csrc_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'csrc')
+    if _csrc_dir not in _sys.path:
+        _sys.path.insert(0, _csrc_dir)
     import resq_gemm_v2
     HAS_CUTLASS = True
 except ImportError:
