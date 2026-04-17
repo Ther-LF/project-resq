@@ -4,17 +4,12 @@
  * Grouped INT8×INT8 → INT32 accumulator GEMM using PtrArray schedule.
  * Each group g computes: D_g[M,N] = A_g[M,K] @ B_g[N,K]^T
  *
- * Used for per-group activation quantization (o_proj):
- *   - G groups, each with independent A pointer and B column slice
- *   - All groups share same M, N, K dimensions
- *   - Output: G separate (M,N) float32 matrices
- *
- * Scale/bias/shift handled in Python post-processing.
+ * All metadata (problem_sizes, pointer arrays, strides) must be
+ * pre-allocated on device by the caller. No cudaMalloc/cudaMemcpy here.
  */
 
 #include <cuda_runtime.h>
 #include <iostream>
-#include <vector>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -57,39 +52,28 @@ using ElementCompute     = float;
 using ArchTag        = cutlass::arch::Sm90;
 using OperatorClass  = cutlass::arch::OpClassTensorOp;
 
-// TileShape: K=64 to handle K=56 padded to 64
 using TileShape    = Shape<_128, _128, _64>;
 using ClusterShape = Shape<_1, _1, _1>;
 
-// Grouped/PtrArray schedules
 using KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
 using EpilogueSchedule = cutlass::epilogue::PtrArrayNoSmemWarpSpecialized;
 
-// Problem shape for grouped GEMM
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
-
-// ============================================================
-// Epilogue: convert INT32 acc to float output
-// ============================================================
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
     TileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccumulator, ElementCompute,
-    ElementC, LayoutC *, AlignmentC,       // pointer type for grouped
-    ElementD, LayoutD *, AlignmentD,       // pointer type for grouped
+    ElementC, LayoutC *, AlignmentC,
+    ElementD, LayoutD *, AlignmentD,
     EpilogueSchedule
 >::CollectiveOp;
 
-// ============================================================
-// Mainloop: INT8×INT8 → INT32, grouped
-// ============================================================
-
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
-    ElementA, LayoutA *, AlignmentA,       // pointer type for grouped
-    ElementB, LayoutB *, AlignmentB,       // pointer type for grouped
+    ElementA, LayoutA *, AlignmentA,
+    ElementB, LayoutB *, AlignmentB,
     ElementAccumulator,
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
@@ -106,9 +90,6 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-// ============================================================
-// Stride types — use Internal variants for grouped mode
-// ============================================================
 using StrideA = typename GemmKernel::InternalStrideA;
 using StrideB = typename GemmKernel::InternalStrideB;
 using StrideC = typename GemmKernel::InternalStrideC;
@@ -126,106 +107,80 @@ using StrideD = typename GemmKernel::InternalStrideD;
   }
 
 // ============================================================
-// Run grouped GEMM: G independent (M,K)×(N,K)^T → (M,N) each
+// Run grouped GEMM — ALL pointers are already on device.
+// No cudaMalloc, no cudaMemcpy, just launch.
 // ============================================================
 
 void run_grouped_gemm_s8s8(
-    int ngroups, int M, int N, int K,
-    const int8_t** A_ptrs_host,  // [ngroups] pointers to (M, K) RowMajor
-    const int8_t** B_ptrs_host,  // [ngroups] pointers to (N, K) RowMajor→ColMajor
-    float** D_ptrs_host,         // [ngroups] pointers to (M, N) RowMajor output
-    cudaStream_t stream = nullptr)
+    int ngroups,
+    // All device pointers, pre-allocated by binding layer:
+    void* problem_sizes_dev,     // device: ProblemShape::UnderlyingProblemShape[ngroups]
+    void* problem_sizes_host,    // host: same data for CUTLASS host-side planning
+    const int8_t** A_ptrs_dev,   // device: [ngroups] pointers into A data
+    StrideA* strides_A_dev,      // device: [ngroups]
+    const int8_t** B_ptrs_dev,   // device: [ngroups]
+    StrideB* strides_B_dev,      // device: [ngroups]
+    StrideC* strides_C_dev,      // device: [ngroups]
+    float** D_ptrs_dev,          // device: [ngroups] pointers into D data
+    StrideD* strides_D_dev,      // device: [ngroups]
+    void* workspace,             // device: pre-allocated workspace (or nullptr)
+    cudaStream_t stream)
 {
-    // Build problem sizes (all identical)
     using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
-    std::vector<UnderlyingProblemShape> problem_sizes_host(ngroups);
-    for (int i = 0; i < ngroups; i++) {
-        problem_sizes_host[i] = make_shape(M, N, K);
-    }
-
-    // Build strides (all identical since same M,N,K)
-    auto stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-    auto stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-    auto stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-    auto stride_d = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
-
-    std::vector<StrideA> strides_A_host(ngroups, stride_a);
-    std::vector<StrideB> strides_B_host(ngroups, stride_b);
-    std::vector<StrideC> strides_C_host(ngroups, stride_c);
-    std::vector<StrideD> strides_D_host(ngroups, stride_d);
-
-    // Allocate device arrays
-    UnderlyingProblemShape* problem_sizes_dev;
-    const int8_t** A_ptrs_dev;
-    const int8_t** B_ptrs_dev;
-    float** D_ptrs_dev;
-    StrideA* strides_A_dev;
-    StrideB* strides_B_dev;
-    StrideC* strides_C_dev;
-    StrideD* strides_D_dev;
-
-    cudaMalloc(&problem_sizes_dev, ngroups * sizeof(UnderlyingProblemShape));
-    cudaMalloc(&A_ptrs_dev, ngroups * sizeof(const int8_t*));
-    cudaMalloc(&B_ptrs_dev, ngroups * sizeof(const int8_t*));
-    cudaMalloc(&D_ptrs_dev, ngroups * sizeof(float*));
-    cudaMalloc(&strides_A_dev, ngroups * sizeof(StrideA));
-    cudaMalloc(&strides_B_dev, ngroups * sizeof(StrideB));
-    cudaMalloc(&strides_C_dev, ngroups * sizeof(StrideC));
-    cudaMalloc(&strides_D_dev, ngroups * sizeof(StrideD));
-
-    cudaMemcpyAsync(problem_sizes_dev, problem_sizes_host.data(),
-        ngroups * sizeof(UnderlyingProblemShape), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(A_ptrs_dev, A_ptrs_host,
-        ngroups * sizeof(const int8_t*), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(B_ptrs_dev, B_ptrs_host,
-        ngroups * sizeof(const int8_t*), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(D_ptrs_dev, D_ptrs_host,
-        ngroups * sizeof(float*), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(strides_A_dev, strides_A_host.data(),
-        ngroups * sizeof(StrideA), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(strides_B_dev, strides_B_host.data(),
-        ngroups * sizeof(StrideB), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(strides_C_dev, strides_C_host.data(),
-        ngroups * sizeof(StrideC), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(strides_D_dev, strides_D_host.data(),
-        ngroups * sizeof(StrideD), cudaMemcpyHostToDevice, stream);
 
     typename Gemm::Arguments args {
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {ngroups, problem_sizes_dev, problem_sizes_host.data()},
+        {ngroups,
+         static_cast<UnderlyingProblemShape*>(problem_sizes_dev),
+         static_cast<UnderlyingProblemShape*>(problem_sizes_host)},
         {A_ptrs_dev, strides_A_dev, B_ptrs_dev, strides_B_dev},
         {{1.0f, 0.0f}, nullptr, strides_C_dev, D_ptrs_dev, strides_D_dev}
     };
 
     Gemm gemm_op;
     CUTLASS_CHECK(gemm_op.can_implement(args));
-
-    size_t workspace_size = gemm_op.get_workspace_size(args);
-    void* workspace = nullptr;
-    if (workspace_size > 0) {
-        cudaMalloc(&workspace, workspace_size);
-    }
-
     CUTLASS_CHECK(gemm_op.initialize(args, workspace, stream));
     CUTLASS_CHECK(gemm_op(stream));
+}
 
-    // Sync before freeing temp arrays
-    cudaStreamSynchronize(stream);
+// Helper: query workspace size for a given config
+size_t get_grouped_gemm_workspace_size(int ngroups, int M, int N, int K) {
+    using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
 
-    cudaFree(problem_sizes_dev);
-    cudaFree(A_ptrs_dev);
-    cudaFree(B_ptrs_dev);
-    cudaFree(D_ptrs_dev);
-    cudaFree(strides_A_dev);
-    cudaFree(strides_B_dev);
-    cudaFree(strides_C_dev);
-    cudaFree(strides_D_dev);
-    if (workspace) cudaFree(workspace);
+    // Build minimal args to query workspace
+    std::vector<UnderlyingProblemShape> sizes_host(ngroups, make_shape(M, N, K));
+
+    typename Gemm::Arguments args {
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {ngroups, nullptr, sizes_host.data()},
+        {nullptr, nullptr, nullptr, nullptr},
+        {{1.0f, 0.0f}, nullptr, nullptr, nullptr, nullptr}
+    };
+
+    Gemm gemm_op;
+    return gemm_op.get_workspace_size(args);
+}
+
+// Helper: compute stride for given dimensions
+StrideA make_stride_a(int M, int K) {
+    return cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+}
+StrideB make_stride_b(int N, int K) {
+    return cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+}
+StrideC make_stride_c(int M, int N) {
+    return cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+}
+StrideD make_stride_d(int M, int N) {
+    return cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
 }
 
 #else
-void run_grouped_gemm_s8s8(int, int, int, int,
-    const int8_t**, const int8_t**, float**, cudaStream_t) {
+
+void run_grouped_gemm_s8s8(int, void*, void*, const int8_t**, void*,
+    const int8_t**, void*, void*, float**, void*, void*, cudaStream_t) {
     throw std::runtime_error("SM90 not supported");
 }
+size_t get_grouped_gemm_workspace_size(int, int, int, int) { return 0; }
+
 #endif
