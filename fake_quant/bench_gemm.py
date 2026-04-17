@@ -4,6 +4,10 @@
 Loads data from gemm_data/ directory (produced by collect_gemm_data.py),
 runs GEMM tests, computes accuracy and performance metrics, outputs table + JSON.
 
+Timing convention: measure the full "module replacement" path —
+from quantized int inputs to fp16 output (including dequant/scale/bias),
+but NOT including data transfer, weight preprocessing, or activation quantization.
+
 Usage:
     python bench_gemm.py --data_dir ./gemm_data [--layers q_proj,o_proj,gate_proj,down_proj] [--batch_sizes 1,2,4]
 """
@@ -99,274 +103,6 @@ def _extract_per_token_scale(scale_tensor):
     return scale_tensor
 
 
-
-# ============================================================
-# GEMM Implementations
-# ============================================================
-
-def gemm_fp16_baseline(x_fp16, W_fp16):
-    """FP16 matmul, no quantization."""
-    if x_fp16.dim() > 3:
-        batch, seq = x_fp16.shape[0], x_fp16.shape[1]
-        x_fp16 = x_fp16.reshape(batch, seq, -1)
-    x_flat = x_fp16.reshape(-1, x_fp16.shape[-1])
-    return (x_flat @ W_fp16.T).reshape(*x_fp16.shape[:-1], -1)
-
-
-def _real_quant_single_group_main(q_x_raw, zero_x, s_x, q_w, s_w):
-    """Main group (4-bit) quant matmul using shift-8 + bias formula (same as INT4 GEMM).
-
-    Main group: q_int [0,15], needs shift-8 to fit int4 [-8,7].
-    Shift-8 trick (same idea as high group's shift-128):
-        q_shifted = q_int - 8             → [-8,7] fits int4
-        bias = (8 - zero) * colsum(q_w)   → precomputed per (M, N)
-        Y = s_x * s_w * (q_shifted @ q_w^T + bias)
-
-    q_x_raw: (M, K) raw unsigned q_int as float (e.g., [0,15])
-    zero_x:  (M, 1) or scalar zero point as float
-    s_x:     (M, 1) per-token scale as float
-    q_w:     (N, K) centered weight int as float (e.g., [-8,7])
-    s_w:     (N, 1) per-channel weight scale
-    """
-    q_shifted = q_x_raw - 8.0  # [-8, 7], fits int4
-
-    # Precompute bias: (8 - zero) * colsum(q_w)
-    shift_minus_zero = 8.0 - zero_x  # (M, 1)
-    w_colsum = q_w.float().sum(dim=1, keepdim=True).T  # (1, N)
-    bias = shift_minus_zero @ w_colsum  # (M, N)
-
-    # fp32 simulates: q_shifted_int4 @ q_w_int4^T
-    y_int = q_shifted.float() @ q_w.float().T  # fp32 simulates int matmul
-
-    y = s_x * s_w.flatten().unsqueeze(0) * (y_int + bias)
-    return y
-
-
-def _real_quant_single_group_high(q_x_raw, zero_x, s_x, q_w, s_w):
-    """High group (8-bit) quant matmul using shift-128 + bias formula (same as INT GEMM).
-
-    High group: q_int [0,255], centered overflows int8.
-    Shift-128 trick:
-        q_shifted = q_int - 128            → [-128,127] fits int8
-        bias = (128 - zero) * colsum(q_w)  → precomputed per (M, N)
-        Y = s_x * s_w * (q_shifted @ q_w^T + bias)
-
-    q_x_raw: (M, K) raw unsigned q_int as float (e.g., [0,255])
-    zero_x:  (M, 1) or scalar zero point as float
-    s_x:     (M, 1) per-token scale as float
-    q_w:     (N, K) centered weight int as float (e.g., [-128,127])
-    s_w:     (N, 1) per-channel weight scale
-    """
-    q_shifted = q_x_raw - 128.0  # [-128, 127], same as INT GEMM .to(int8)
-
-    # Precompute bias: (128 - zero) * colsum(q_w)
-    shift_minus_zero = 128.0 - zero_x  # (M, 1)
-    w_colsum = q_w.float().sum(dim=1, keepdim=True).T  # (1, N)
-    bias = shift_minus_zero @ w_colsum  # (M, N)
-
-    # fp32 simulates: q_shifted_int8 @ q_w_int8^T
-    y_int = q_shifted.float() @ q_w.float().T  # fp32 simulates int matmul
-
-    y = s_x * s_w.flatten().unsqueeze(0) * (y_int + bias)
-    return y
-
-
-def gemm_real_quant(act_quant_main, act_quant_high,
-                    weight_int_main, weight_int_high):
-    """Quantization accuracy baseline — fp32 simulation of exact INT GEMM formula.
-
-    Per-token layers: uses shift-8/shift-128 + bias formula (same as INT TC kernel).
-    Per-group layers (o_proj): per-group shift+bias INT formula, accumulated across groups.
-    Both paths use the same shift+bias trick that the real CUTLASS kernel will use.
-    """
-    q_w_m = weight_int_main['q_int'].cuda().float()
-    s_w_m = weight_int_main['scale'].cuda().float()
-
-    q_w_h = weight_int_high['q_int'].cuda().float() if weight_int_high else None
-    s_w_h = weight_int_high['scale'].cuda().float() if weight_int_high else None
-
-    # Get raw (uncentered) activation data
-    q_x_m_raw = act_quant_main['q_int'].cuda().float()
-    s_x_m = act_quant_main['scale'].cuda().float()
-    z_x_m = act_quant_main.get('zero', None)
-    if z_x_m is not None:
-        z_x_m = z_x_m.cuda().float()
-    else:
-        z_x_m = torch.zeros_like(q_x_m_raw[..., :1])
-
-    grouped = (s_x_m.dim() > 3)  # (batch, seq, ngroups, 1) = grouped
-    N = q_w_m.shape[0]
-
-    if not grouped:
-        # === Per-token ===
-        s_x_tok = _extract_per_token_scale(s_x_m).reshape(-1, 1)
-        z_x_tok = _extract_per_token_scale(z_x_m).reshape(-1, 1) if z_x_m.shape[-1] > 1 else z_x_m.reshape(-1, 1)
-        q_x_flat = q_x_m_raw.reshape(-1, q_x_m_raw.shape[-1])
-        M = q_x_flat.shape[0]
-
-        y_m = _real_quant_single_group_main(q_x_flat, z_x_tok, s_x_tok, q_w_m, s_w_m)
-
-        y_h = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-        if act_quant_high is not None and q_w_h is not None:
-            q_x_h_raw = act_quant_high['q_int'].cuda().float()
-            s_x_h = act_quant_high['scale'].cuda().float()
-            z_x_h = act_quant_high.get('zero', None)
-            if z_x_h is not None:
-                z_x_h = z_x_h.cuda().float()
-            else:
-                z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
-
-            s_x_h_tok = _extract_per_token_scale(s_x_h).reshape(-1, 1)
-            z_x_h_tok = _extract_per_token_scale(z_x_h).reshape(-1, 1) if z_x_h.shape[-1] > 1 else z_x_h.reshape(-1, 1)
-            q_x_h_flat = q_x_h_raw.reshape(-1, q_x_h_raw.shape[-1])
-
-            y_h = _real_quant_single_group_high(q_x_h_flat, z_x_h_tok, s_x_h_tok, q_w_h, s_w_h)
-
-        y = (y_m + y_h).half()
-        return y
-
-    else:
-        # === Per-group (o_proj) ===
-        # Each group has its own activation scale/zero. Use shift+bias INT formula
-        # per group, then accumulate.
-        #
-        # Weight layout (contiguous after column_order):
-        #   q_w_m: (N, ngroups*group_k_m)  e.g. (2048, 1792) for 32 groups × 56
-        #   q_w_h: (N, ngroups*group_k_h)  e.g. (2048, 256)  for 32 groups × 8
-        # Activation layout (per-group):
-        #   q_x_m_raw: (batch, seq, ngroups, group_k_m)  e.g. (..., 32, 56)
-        #   q_x_h_raw: (batch, seq, ngroups, group_k_h)  e.g. (..., 32, 8)
-        #
-        # For each group g:
-        #   y += s_x_m_g * s_w_m * (shift_main(q_x_m_g) @ q_w_m_g^T + bias_m_g)
-        #   y += s_x_h_g * s_w_h * (shift_high(q_x_h_g) @ q_w_h_g^T + bias_h_g)
-
-        batch, seq, ngroups, group_k_m = q_x_m_raw.shape
-        M = batch * seq
-
-        # Flatten activation batch dims
-        q_x_m_flat = q_x_m_raw.reshape(M, ngroups, group_k_m)  # (M, G, 56)
-        s_x_m_flat = s_x_m.reshape(M, ngroups, -1)              # (M, G, 1)
-        z_x_m_flat = z_x_m.reshape(M, ngroups, -1)              # (M, G, 1)
-
-        y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-
-        # Main groups: shift-8 + bias
-        for g in range(ngroups):
-            q_x_g = q_x_m_flat[:, g, :]       # (M, 56)
-            s_x_g = s_x_m_flat[:, g, :]        # (M, 1)
-            z_x_g = z_x_m_flat[:, g, :]        # (M, 1)
-            q_w_g = q_w_m[:, g*group_k_m:(g+1)*group_k_m]  # (N, 56)
-
-            q_shifted = q_x_g - 8.0
-            w_colsum = q_w_g.sum(dim=1, keepdim=True).T     # (1, N)
-            bias = (8.0 - z_x_g) @ w_colsum                 # (M, N)
-            y_int = q_shifted @ q_w_g.T                      # (M, N)
-            y += s_x_g * s_w_m.flatten().unsqueeze(0) * (y_int + bias)
-
-        # High groups: shift-128 + bias
-        if act_quant_high is not None and q_w_h is not None:
-            q_x_h_raw = act_quant_high['q_int'].cuda().float()
-            s_x_h = act_quant_high['scale'].cuda().float()
-            z_x_h = act_quant_high.get('zero', None)
-            if z_x_h is not None:
-                z_x_h = z_x_h.cuda().float()
-            else:
-                z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
-
-            group_k_h = q_x_h_raw.shape[-1]
-            q_x_h_flat = q_x_h_raw.reshape(M, ngroups, group_k_h)
-            s_x_h_flat = s_x_h.reshape(M, ngroups, -1)
-            z_x_h_flat = z_x_h.reshape(M, ngroups, -1)
-
-            for g in range(ngroups):
-                q_x_g = q_x_h_flat[:, g, :]       # (M, 8)
-                s_x_g = s_x_h_flat[:, g, :]        # (M, 1)
-                z_x_g = z_x_h_flat[:, g, :]        # (M, 1)
-                q_w_g = q_w_h[:, g*group_k_h:(g+1)*group_k_h]  # (N, 8)
-
-                q_shifted = q_x_g - 128.0
-                w_colsum = q_w_g.sum(dim=1, keepdim=True).T     # (1, N)
-                bias = (128.0 - z_x_g) @ w_colsum               # (M, N)
-                y_int = q_shifted @ q_w_g.T                      # (M, N)
-                y += s_x_g * s_w_h.flatten().unsqueeze(0) * (y_int + bias)
-
-        return y.half().reshape(batch, seq, N)
-
-def gemm_cutlass_int8(act_quant_main, act_quant_high,
-                      weight_int_main, weight_int_high):
-    """Baseline 3: CUTLASS INT8 TC GEMM with Python-side scale/bias.
-
-    Per-token only. Two CUTLASS kernel launches (main + high),
-    scale/bias/shift handled in Python.
-    Uses real INT8 Tensor Core with INT32 accumulation.
-    """
-    if not HAS_CUTLASS:
-        raise RuntimeError("resq_gemm_v2 not available")
-
-    q_w_m = weight_int_main['q_int'].cuda()   # (N, K_m) int values as float/int
-    s_w_m = weight_int_main['scale'].cuda().float()
-
-    q_w_h = weight_int_high['q_int'].cuda() if weight_int_high else None
-    s_w_h = weight_int_high['scale'].cuda().float() if weight_int_high else None
-
-    # Activation data
-    q_x_m_raw = act_quant_main['q_int'].cuda()
-    s_x_m = act_quant_main['scale'].cuda().float()
-    z_x_m = act_quant_main.get('zero', None)
-    if z_x_m is not None:
-        z_x_m = z_x_m.cuda().float()
-    else:
-        z_x_m = torch.zeros_like(q_x_m_raw[..., :1]).float()
-
-    N = q_w_m.shape[0]
-    s_x_tok = _extract_per_token_scale(s_x_m).reshape(-1, 1)
-    z_x_tok = _extract_per_token_scale(z_x_m).reshape(-1, 1) if z_x_m.shape[-1] > 1 else z_x_m.reshape(-1, 1)
-    q_x_flat = q_x_m_raw.reshape(-1, q_x_m_raw.shape[-1])
-    M = q_x_flat.shape[0]
-
-    # === Main group: shift-8, CUTLASS INT8 TC ===
-    q_x_m_shifted = (q_x_flat.float() - 8.0).to(torch.int8)   # [-8,7] fits int8
-    q_w_m_int8 = q_w_m.to(torch.int8)                           # already [-8,7]
-    # Ensure contiguous for CUTLASS
-    q_x_m_shifted = q_x_m_shifted.contiguous()
-    q_w_m_int8 = q_w_m_int8.contiguous()
-
-    D_m = resq_gemm_v2.gemm_s8s8(q_x_m_shifted, q_w_m_int8)   # (M, N) float32
-    # Bias: (8 - zero) * colsum(q_w)
-    w_colsum_m = q_w_m_int8.float().sum(dim=1, keepdim=True).T  # (1, N)
-    bias_m = (8.0 - z_x_tok) @ w_colsum_m                       # (M, N)
-    Y_m = s_x_tok * s_w_m.flatten().unsqueeze(0) * (D_m + bias_m)
-
-    # === High group: shift-128, CUTLASS INT8 TC ===
-    Y_h = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-    if act_quant_high is not None and q_w_h is not None:
-        q_x_h_raw = act_quant_high['q_int'].cuda()
-        s_x_h = act_quant_high['scale'].cuda().float()
-        z_x_h = act_quant_high.get('zero', None)
-        if z_x_h is not None:
-            z_x_h = z_x_h.cuda().float()
-        else:
-            z_x_h = torch.zeros_like(q_x_h_raw[..., :1]).float()
-
-        s_x_h_tok = _extract_per_token_scale(s_x_h).reshape(-1, 1)
-        z_x_h_tok = _extract_per_token_scale(z_x_h).reshape(-1, 1) if z_x_h.shape[-1] > 1 else z_x_h.reshape(-1, 1)
-        q_x_h_flat = q_x_h_raw.reshape(-1, q_x_h_raw.shape[-1])
-
-        q_x_h_shifted = (q_x_h_flat.float() - 128.0).to(torch.int8)  # [-128,127]
-        q_w_h_int8 = q_w_h.to(torch.int8)
-        q_x_h_shifted = q_x_h_shifted.contiguous()
-        q_w_h_int8 = q_w_h_int8.contiguous()
-
-        D_h = resq_gemm_v2.gemm_s8s8(q_x_h_shifted, q_w_h_int8)
-        w_colsum_h = q_w_h_int8.float().sum(dim=1, keepdim=True).T
-        bias_h = (128.0 - z_x_h_tok) @ w_colsum_h
-        Y_h = s_x_h_tok * s_w_h.flatten().unsqueeze(0) * (D_h + bias_h)
-
-    y = (Y_m + Y_h).half()
-    return y
-
-
 def _pad_k_to_multiple(t, multiple=16):
     """Pad last dim of tensor to nearest multiple (for CUTLASS alignment)."""
     K = t.shape[-1]
@@ -378,108 +114,330 @@ def _pad_k_to_multiple(t, multiple=16):
     return torch.cat([t, torch.zeros(pad_shape, dtype=t.dtype, device=t.device)], dim=-1)
 
 
-def gemm_cutlass_int8_grouped(act_quant_main, act_quant_high,
-                               weight_int_main, weight_int_high):
-    """Baseline 3 grouped: CUTLASS INT8 TC grouped GEMM for per-group activation.
+# ============================================================
+# Data preparation — all preprocessing done ONCE, outside timing
+# ============================================================
 
-    Single kernel launch for G groups using CUTLASS PtrArray schedule.
-    Each group: (M, K_g) × (N, K_g)^T → (M, N), post-process with per-group scale+bias.
+def prepare_per_token_data(act_quant_main, act_quant_high,
+                           weight_int_main, weight_int_high):
+    """Prepare all GPU tensors for per-token layers. Called once, outside timing.
+
+    Returns a dict with everything needed by the compute functions,
+    all on GPU, all in the right dtype.
     """
-    if not HAS_CUTLASS:
-        raise RuntimeError("resq_gemm_v2 not available")
+    d = {}
 
-    q_w_m = weight_int_main['q_int'].cuda()   # (N, G*K_g)
+    # Weight (static, precomputed)
+    q_w_m = weight_int_main['q_int'].cuda().float()
     s_w_m = weight_int_main['scale'].cuda().float()  # (N, 1)
+    d['q_w_m'] = q_w_m
+    d['q_w_m_int8'] = q_w_m.to(torch.int8).contiguous()
+    d['s_w_m'] = s_w_m.flatten().unsqueeze(0)         # (1, N)
+    d['w_colsum_m'] = d['q_w_m_int8'].float().sum(dim=1, keepdim=True).T  # (1, N)
 
-    q_w_h = weight_int_high['q_int'].cuda() if weight_int_high else None
-    s_w_h = weight_int_high['scale'].cuda().float() if weight_int_high else None
+    N = q_w_m.shape[0]
+    d['N'] = N
 
-    # Activation: (batch, seq, G, K_g) with per-group scale (batch, seq, G, 1)
-    q_x_m_raw = act_quant_main['q_int'].cuda()      # (B, S, G, K_g)
-    s_x_m = act_quant_main['scale'].cuda().float()   # (B, S, G, 1)
+    # Activation main
+    q_x_m_raw = act_quant_main['q_int'].cuda().float()
+    s_x_m = act_quant_main['scale'].cuda().float()
     z_x_m = act_quant_main.get('zero', None)
     if z_x_m is not None:
         z_x_m = z_x_m.cuda().float()
     else:
-        z_x_m = torch.zeros_like(q_x_m_raw[..., :1]).float()
+        z_x_m = torch.zeros_like(q_x_m_raw[..., :1])
 
-    batch, seq, G, K_g = q_x_m_raw.shape
-    M = batch * seq
-    N = q_w_m.shape[0]
+    s_x_tok = _extract_per_token_scale(s_x_m).reshape(-1, 1)
+    z_x_tok = _extract_per_token_scale(z_x_m).reshape(-1, 1) if z_x_m.shape[-1] > 1 else z_x_m.reshape(-1, 1)
+    q_x_flat = q_x_m_raw.reshape(-1, q_x_m_raw.shape[-1])
 
-    # Flatten batch dims
-    q_x_m_flat = q_x_m_raw.reshape(M, G, K_g)   # (M, G, K_g)
-    s_x_m_flat = s_x_m.reshape(M, G, 1)          # (M, G, 1)
-    z_x_m_flat = z_x_m.reshape(M, G, 1)          # (M, G, 1)
+    d['q_x_m_flat'] = q_x_flat                                # (M, K_m) float
+    d['q_x_m_shifted_f32'] = q_x_flat - 8.0                   # (M, K_m) float, for B2
+    d['q_x_m_shifted_i8'] = (q_x_flat - 8.0).to(torch.int8).contiguous()  # (M, K_m) int8, for B3
+    d['s_x_m'] = s_x_tok                                       # (M, 1)
+    d['z_x_m'] = z_x_tok                                       # (M, 1)
+    d['shift_minus_z_m'] = 8.0 - z_x_tok                      # (M, 1) precomputed
+    d['M'] = q_x_flat.shape[0]
 
-    # === Main groups: shift-8, grouped CUTLASS ===
-    # Prepare A: (G, M, K_pad) int8 — shift and pad
-    q_x_shifted = (q_x_m_flat.float() - 8.0).to(torch.int8)  # (M, G, K_g)
-    q_x_shifted = q_x_shifted.permute(1, 0, 2).contiguous()   # (G, M, K_g)
-    q_x_shifted = _pad_k_to_multiple(q_x_shifted, 16)          # (G, M, K_pad)
+    # High group
+    d['has_high'] = (act_quant_high is not None and weight_int_high is not None)
+    if d['has_high']:
+        q_w_h = weight_int_high['q_int'].cuda().float()
+        s_w_h = weight_int_high['scale'].cuda().float()
+        d['q_w_h'] = q_w_h
+        d['q_w_h_int8'] = q_w_h.to(torch.int8).contiguous()
+        d['s_w_h'] = s_w_h.flatten().unsqueeze(0)
+        d['w_colsum_h'] = d['q_w_h_int8'].float().sum(dim=1, keepdim=True).T
 
-    # Prepare B: (G, N, K_pad) int8 — slice weight into groups and pad
-    q_w_m_int8 = q_w_m.to(torch.int8)
-    B_groups = []
-    for g in range(G):
-        B_g = q_w_m_int8[:, g*K_g:(g+1)*K_g]  # (N, K_g)
-        B_groups.append(B_g)
-    B_stacked = torch.stack(B_groups, dim=0).contiguous()  # (G, N, K_g)
-    B_stacked = _pad_k_to_multiple(B_stacked, 16)           # (G, N, K_pad)
-
-    # Single kernel launch: G independent (M, K_pad) × (N, K_pad)^T → (G, M, N)
-    D_m = resq_gemm_v2.grouped_gemm_s8s8(q_x_shifted, B_stacked)  # (G, M, N)
-
-    # Post-process: per-group bias and scale
-    # bias_g = (8 - z_x_g) * colsum(q_w_g) for each group
-    y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
-    s_w_m_flat = s_w_m.flatten().unsqueeze(0)  # (1, N)
-
-    for g in range(G):
-        q_w_g = q_w_m_int8[:, g*K_g:(g+1)*K_g].float()  # (N, K_g)
-        w_colsum = q_w_g.sum(dim=1, keepdim=True).T       # (1, N)
-        bias_g = (8.0 - z_x_m_flat[:, g, :]) @ w_colsum   # (M, N)
-        y += s_x_m_flat[:, g, :] * s_w_m_flat * (D_m[g] + bias_g)
-
-    # === High groups: shift-128, grouped CUTLASS ===
-    if act_quant_high is not None and q_w_h is not None:
-        q_x_h_raw = act_quant_high['q_int'].cuda()
+        q_x_h_raw = act_quant_high['q_int'].cuda().float()
         s_x_h = act_quant_high['scale'].cuda().float()
         z_x_h = act_quant_high.get('zero', None)
         if z_x_h is not None:
             z_x_h = z_x_h.cuda().float()
         else:
-            z_x_h = torch.zeros_like(q_x_h_raw[..., :1]).float()
+            z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
+
+        s_x_h_tok = _extract_per_token_scale(s_x_h).reshape(-1, 1)
+        z_x_h_tok = _extract_per_token_scale(z_x_h).reshape(-1, 1) if z_x_h.shape[-1] > 1 else z_x_h.reshape(-1, 1)
+        q_x_h_flat = q_x_h_raw.reshape(-1, q_x_h_raw.shape[-1])
+
+        d['q_x_h_flat'] = q_x_h_flat
+        d['q_x_h_shifted_f32'] = q_x_h_flat - 128.0
+        d['q_x_h_shifted_i8'] = (q_x_h_flat - 128.0).to(torch.int8).contiguous()
+        d['s_x_h'] = s_x_h_tok
+        d['z_x_h'] = z_x_h_tok
+        d['shift_minus_z_h'] = 128.0 - z_x_h_tok
+
+    return d
+
+
+def prepare_grouped_data(act_quant_main, act_quant_high,
+                         weight_int_main, weight_int_high):
+    """Prepare all GPU tensors for per-group (o_proj) layers. Called once, outside timing.
+
+    Returns a dict with everything needed, all on GPU, precomputed.
+    """
+    d = {}
+
+    q_w_m = weight_int_main['q_int'].cuda().float()
+    s_w_m = weight_int_main['scale'].cuda().float()
+    N = q_w_m.shape[0]
+    d['N'] = N
+    d['s_w_m'] = s_w_m.flatten().unsqueeze(0)  # (1, N)
+
+    q_x_m_raw = act_quant_main['q_int'].cuda().float()  # (B, S, G, K_g)
+    s_x_m = act_quant_main['scale'].cuda().float()       # (B, S, G, 1)
+    z_x_m = act_quant_main.get('zero', None)
+    if z_x_m is not None:
+        z_x_m = z_x_m.cuda().float()
+    else:
+        z_x_m = torch.zeros_like(q_x_m_raw[..., :1])
+
+    batch, seq, G, K_g = q_x_m_raw.shape
+    M = batch * seq
+    d['batch'] = batch
+    d['seq'] = seq
+    d['G'] = G
+    d['K_g'] = K_g
+    d['M'] = M
+
+    q_x_m_flat = q_x_m_raw.reshape(M, G, K_g)
+    s_x_m_flat = s_x_m.reshape(M, G, 1)
+    z_x_m_flat = z_x_m.reshape(M, G, 1)
+
+    d['q_x_m_flat'] = q_x_m_flat
+    d['s_x_m_flat'] = s_x_m_flat
+    d['z_x_m_flat'] = z_x_m_flat
+
+    # Precompute per-group weight data (static)
+    q_w_m_int8 = q_w_m.to(torch.int8)
+    d['q_w_m_int8'] = q_w_m_int8
+    d['q_w_m'] = q_w_m
+
+    # Per-group w_colsum: (G, 1, N) — precomputed once
+    w_colsums_m = []
+    for g in range(G):
+        q_w_g = q_w_m_int8[:, g * K_g:(g + 1) * K_g].float()  # (N, K_g)
+        w_colsums_m.append(q_w_g.sum(dim=1, keepdim=True).T)    # (1, N)
+    d['w_colsums_m'] = torch.stack(w_colsums_m, dim=0)  # (G, 1, N)
+
+    # For Baseline 2: per-group fp32 weight slices (G, N, K_g)
+    w_slices_m = []
+    for g in range(G):
+        w_slices_m.append(q_w_m[:, g * K_g:(g + 1) * K_g])
+    d['w_slices_m'] = torch.stack(w_slices_m, dim=0)  # (G, N, K_g)
+
+    # For Baseline 3: pre-shifted activation + pre-padded weight (CUTLASS input)
+    q_x_shifted = (q_x_m_flat - 8.0).to(torch.int8)            # (M, G, K_g)
+    q_x_shifted = q_x_shifted.permute(1, 0, 2).contiguous()     # (G, M, K_g)
+    d['A_grouped_m'] = _pad_k_to_multiple(q_x_shifted, 16)      # (G, M, K_pad)
+
+    B_groups = []
+    for g in range(G):
+        B_groups.append(q_w_m_int8[:, g * K_g:(g + 1) * K_g])
+    B_stacked = torch.stack(B_groups, dim=0).contiguous()        # (G, N, K_g)
+    d['B_grouped_m'] = _pad_k_to_multiple(B_stacked, 16)        # (G, N, K_pad)
+
+    # High group
+    d['has_high'] = (act_quant_high is not None and weight_int_high is not None)
+    if d['has_high']:
+        q_w_h = weight_int_high['q_int'].cuda().float()
+        s_w_h = weight_int_high['scale'].cuda().float()
+        d['s_w_h'] = s_w_h.flatten().unsqueeze(0)
+        q_w_h_int8 = q_w_h.to(torch.int8)
+        d['q_w_h_int8'] = q_w_h_int8
+
+        q_x_h_raw = act_quant_high['q_int'].cuda().float()  # (B, S, G, K_h)
+        s_x_h = act_quant_high['scale'].cuda().float()
+        z_x_h = act_quant_high.get('zero', None)
+        if z_x_h is not None:
+            z_x_h = z_x_h.cuda().float()
+        else:
+            z_x_h = torch.zeros_like(q_x_h_raw[..., :1])
 
         K_h = q_x_h_raw.shape[-1]
+        d['K_h'] = K_h
         q_x_h_flat = q_x_h_raw.reshape(M, G, K_h)
-        s_x_h_flat = s_x_h.reshape(M, G, 1)
-        z_x_h_flat = z_x_h.reshape(M, G, 1)
+        d['q_x_h_flat'] = q_x_h_flat
+        d['s_x_h_flat'] = s_x_h.reshape(M, G, 1)
+        d['z_x_h_flat'] = z_x_h.reshape(M, G, 1)
 
-        q_x_h_shifted = (q_x_h_flat.float() - 128.0).to(torch.int8)
+        w_colsums_h = []
+        for g in range(G):
+            q_w_hg = q_w_h_int8[:, g * K_h:(g + 1) * K_h].float()
+            w_colsums_h.append(q_w_hg.sum(dim=1, keepdim=True).T)
+        d['w_colsums_h'] = torch.stack(w_colsums_h, dim=0)  # (G, 1, N)
+
+        w_slices_h = []
+        for g in range(G):
+            w_slices_h.append(q_w_h[:, g * K_h:(g + 1) * K_h])
+        d['w_slices_h'] = torch.stack(w_slices_h, dim=0)
+
+        q_x_h_shifted = (q_x_h_flat - 128.0).to(torch.int8)
         q_x_h_shifted = q_x_h_shifted.permute(1, 0, 2).contiguous()
-        q_x_h_shifted = _pad_k_to_multiple(q_x_h_shifted, 16)
+        d['A_grouped_h'] = _pad_k_to_multiple(q_x_h_shifted, 16)
 
-        q_w_h_int8 = q_w_h.to(torch.int8)
         B_h_groups = []
         for g in range(G):
-            B_h_groups.append(q_w_h_int8[:, g*K_h:(g+1)*K_h])
+            B_h_groups.append(q_w_h_int8[:, g * K_h:(g + 1) * K_h])
         B_h_stacked = torch.stack(B_h_groups, dim=0).contiguous()
-        B_h_stacked = _pad_k_to_multiple(B_h_stacked, 16)
+        d['B_grouped_h'] = _pad_k_to_multiple(B_h_stacked, 16)
 
-        D_h = resq_gemm_v2.grouped_gemm_s8s8(q_x_h_shifted, B_h_stacked)
+    return d
 
-        s_w_h_flat = s_w_h.flatten().unsqueeze(0)
+
+# ============================================================
+# GEMM implementations — ONLY compute, all inputs already on GPU
+# ============================================================
+
+def gemm_fp16(x_fp16, W_fp16):
+    """Baseline 1: FP16 matmul. Input fp16, output fp16."""
+    x_flat = x_fp16.reshape(-1, x_fp16.shape[-1])
+    return (x_flat @ W_fp16.T).half()
+
+
+# --- Baseline 2: fp32 simulation of INT GEMM ---
+
+def gemm_b2_per_token(d):
+    """Baseline 2, per-token: fp32-simulated INT GEMM + dequant → fp16.
+
+    Timed operations:
+      1. fp32 matmul: q_x_shifted @ q_w^T                (simulates INT TC)
+      2. bias:        (shift - zero) * w_colsum            (broadcast)
+      3. scale:       s_x * s_w * (matmul + bias)          (elementwise)
+      4. .half()                                            (fp16 output)
+    """
+    # Main group
+    y_int_m = d['q_x_m_shifted_f32'] @ d['q_w_m'].T           # fp32 matmul
+    bias_m = d['shift_minus_z_m'] * d['w_colsum_m']             # broadcast, not @
+    Y_m = d['s_x_m'] * d['s_w_m'] * (y_int_m + bias_m)
+
+    # High group
+    if d['has_high']:
+        y_int_h = d['q_x_h_shifted_f32'] @ d['q_w_h'].T
+        bias_h = d['shift_minus_z_h'] * d['w_colsum_h']
+        Y_h = d['s_x_h'] * d['s_w_h'] * (y_int_h + bias_h)
+        return (Y_m + Y_h).half()
+
+    return Y_m.half()
+
+
+def gemm_b2_grouped(d):
+    """Baseline 2, grouped (o_proj): fp32-simulated INT GEMM + dequant → fp16.
+
+    Timed operations (per group × G groups):
+      1. fp32 matmul: q_x_g @ q_w_g^T                  (simulates INT TC)
+      2. bias:        (8 - z_g) * w_colsum_g             (broadcast)
+      3. scale:       s_x_g * s_w * (matmul + bias)      (elementwise)
+      4. accumulate across groups
+      5. .half()
+    """
+    M, G, K_g = d['q_x_m_flat'].shape
+    N = d['N']
+    s_w_m = d['s_w_m']
+    y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
+
+    for g in range(G):
+        q_x_g = d['q_x_m_flat'][:, g, :] - 8.0                # (M, K_g) shifted
+        q_w_g = d['w_slices_m'][g]                               # (N, K_g)
+        y_int = q_x_g @ q_w_g.T                                  # fp32 matmul
+        bias_g = (8.0 - d['z_x_m_flat'][:, g, :]) * d['w_colsums_m'][g]  # broadcast
+        y += d['s_x_m_flat'][:, g, :] * s_w_m * (y_int + bias_g)
+
+    if d['has_high']:
+        s_w_h = d['s_w_h']
+        K_h = d['K_h']
         for g in range(G):
-            q_w_h_g = q_w_h_int8[:, g*K_h:(g+1)*K_h].float()
-            w_colsum_h = q_w_h_g.sum(dim=1, keepdim=True).T
-            bias_h_g = (128.0 - z_x_h_flat[:, g, :]) @ w_colsum_h
-            y += s_x_h_flat[:, g, :] * s_w_h_flat * (D_h[g] + bias_h_g)
+            q_x_g = d['q_x_h_flat'][:, g, :] - 128.0
+            q_w_g = d['w_slices_h'][g]
+            y_int = q_x_g @ q_w_g.T
+            bias_g = (128.0 - d['z_x_h_flat'][:, g, :]) * d['w_colsums_h'][g]
+            y += d['s_x_h_flat'][:, g, :] * s_w_h * (y_int + bias_g)
 
-    return y.half().reshape(batch, seq, N)
+    return y.half()
 
 
+# --- Baseline 3: CUTLASS INT8 TC ---
 
+def gemm_b3_per_token(d):
+    """Baseline 3, per-token: CUTLASS INT8 TC GEMM + dequant → fp16.
+
+    Timed operations:
+      1. CUTLASS INT8 GEMM: q_x_shifted_i8 @ q_w_i8^T   (INT8 TC, INT32 acc)
+      2. bias:              (shift - zero) * w_colsum      (broadcast)
+      3. scale:             s_x * s_w * (D + bias)         (elementwise)
+      4. .half()                                            (fp16 output)
+    """
+    # Main group
+    D_m = resq_gemm_v2.gemm_s8s8(d['q_x_m_shifted_i8'], d['q_w_m_int8'])
+    bias_m = d['shift_minus_z_m'] * d['w_colsum_m']
+    Y_m = d['s_x_m'] * d['s_w_m'] * (D_m + bias_m)
+
+    # High group
+    if d['has_high']:
+        D_h = resq_gemm_v2.gemm_s8s8(d['q_x_h_shifted_i8'], d['q_w_h_int8'])
+        bias_h = d['shift_minus_z_h'] * d['w_colsum_h']
+        Y_h = d['s_x_h'] * d['s_w_h'] * (D_h + bias_h)
+        return (Y_m + Y_h).half()
+
+    return Y_m.half()
+
+
+def gemm_b3_grouped(d):
+    """Baseline 3, grouped (o_proj): CUTLASS grouped INT8 TC GEMM + dequant → fp16.
+
+    Timed operations:
+      1. CUTLASS grouped GEMM: G × (M,K)×(N,K)^T          (1 kernel launch)
+      2. per-group bias + scale + accumulate                (Python loop)
+      3. .half()
+    """
+    M = d['M']
+    N = d['N']
+    G = d['G']
+    s_w_m = d['s_w_m']
+
+    # 1 kernel launch for all G groups
+    D_m = resq_gemm_v2.grouped_gemm_s8s8(d['A_grouped_m'], d['B_grouped_m'])  # (G, M, N)
+
+    # Post-process
+    y = torch.zeros(M, N, device='cuda', dtype=torch.float32)
+    for g in range(G):
+        bias_g = (8.0 - d['z_x_m_flat'][:, g, :]) * d['w_colsums_m'][g]  # broadcast
+        y += d['s_x_m_flat'][:, g, :] * s_w_m * (D_m[g] + bias_g)
+
+    if d['has_high']:
+        s_w_h = d['s_w_h']
+        D_h = resq_gemm_v2.grouped_gemm_s8s8(d['A_grouped_h'], d['B_grouped_h'])
+        for g in range(G):
+            bias_g = (128.0 - d['z_x_h_flat'][:, g, :]) * d['w_colsums_h'][g]
+            y += d['s_x_h_flat'][:, g, :] * s_w_h * (D_h[g] + bias_g)
+
+    return y.half()
+
+
+# ============================================================
+# Test definitions
+# ============================================================
 
 ALL_TESTS = [
     ('FP16 baseline', 'fp16'),
@@ -504,7 +462,6 @@ def load_layer_data(layer_dir, bs_key):
     if os.path.exists(path):
         data['weight_fp16'] = torch.load(path, map_location='cpu')
 
-    # Column order (o_proj has reordered K dimension)
     path = os.path.join(layer_dir, 'column_order.pt')
     if os.path.exists(path):
         data['column_order'] = torch.load(path, map_location='cpu')
@@ -544,8 +501,6 @@ def bench_single_layer(layer_dir, bs_key):
     N, K = W_fp16.shape
 
     # Apply column reorder to activation if present (o_proj).
-    # W_fp16 is already rearranged by rearrange_columns() in the model,
-    # so only x_fp16 needs reordering: x[..., col_order] @ W_rearranged^T.
     col_order = data.get('column_order', None)
     if col_order is not None:
         x_fp16 = x_fp16[..., col_order]
@@ -555,60 +510,70 @@ def bench_single_layer(layer_dir, bs_key):
     else:
         M = x_fp16.reshape(-1, x_fp16.shape[-1]).shape[0]
 
-    results = {}
-
-    # Reference output: FP16 matmul in (possibly reordered) space.
-    # Note: x_reord @ W_reord^T == x_orig @ W_orig^T (reorder cancels in matmul)
-    ref_fp16 = gemm_fp16_baseline(x_fp16, W_fp16).cuda()
-
-    # Prepare common quant data
     act_main = data.get('act_quant_main')
     act_high = data.get('act_quant_high')
     w_main = data.get('weight_int_main')
     w_high = data.get('weight_int_high')
+
+    # Detect per-group vs per-token
+    grouped = False
+    if act_main is not None:
+        s_test = act_main['scale']
+        grouped = (s_test.dim() > 3)
+
+    # === Precompute all data ONCE, outside timing ===
+    prep = None
+    if act_main is not None and w_main is not None:
+        if grouped:
+            prep = prepare_grouped_data(act_main, act_high, w_main, w_high)
+        else:
+            prep = prepare_per_token_data(act_main, act_high, w_main, w_high)
+
+    # Reference output
+    ref_fp16 = gemm_fp16(x_fp16, W_fp16).cuda()
+
+    results = {}
 
     for test_name, test_key in ALL_TESTS:
         result = {'accuracy_vs_fp16': None, 'perf': None}
 
         try:
             if test_key == 'fp16':
-                y = gemm_fp16_baseline(x_fp16, W_fp16)
+                y = gemm_fp16(x_fp16, W_fp16)
                 perf = compute_perf_metrics(
-                    lambda: gemm_fp16_baseline(x_fp16, W_fp16), M, N, K)
+                    lambda: gemm_fp16(x_fp16, W_fp16), M, N, K)
 
             elif test_key == 'real_fp32':
-                if act_main is None or w_main is None:
+                if prep is None:
                     result['error'] = 'missing quant data'
                     results[test_name] = result
                     continue
-
-                y = gemm_real_quant(act_main, act_high, w_main, w_high)
-                perf = compute_perf_metrics(
-                    lambda: gemm_real_quant(act_main, act_high, w_main, w_high),
-                    M, N, K, warmup=5, repeat=20)
+                if grouped:
+                    y = gemm_b2_grouped(prep)
+                    perf = compute_perf_metrics(
+                        lambda: gemm_b2_grouped(prep), M, N, K, warmup=5, repeat=50)
+                else:
+                    y = gemm_b2_per_token(prep)
+                    perf = compute_perf_metrics(
+                        lambda: gemm_b2_per_token(prep), M, N, K, warmup=10, repeat=100)
 
             elif test_key == 'cutlass_int8':
                 if not HAS_CUTLASS:
                     result['error'] = 'resq_gemm_v2 not available'
                     results[test_name] = result
                     continue
-                if act_main is None or w_main is None:
+                if prep is None:
                     result['error'] = 'missing quant data'
                     results[test_name] = result
                     continue
-                # Per-token only (skip grouped/o_proj for now)
-                s_x_test = act_main['scale'].cuda().float()
-                if s_x_test.dim() > 3:
-                    # Grouped (o_proj): use grouped GEMM
-                    y = gemm_cutlass_int8_grouped(act_main, act_high, w_main, w_high)
+                if grouped:
+                    y = gemm_b3_grouped(prep)
                     perf = compute_perf_metrics(
-                        lambda: gemm_cutlass_int8_grouped(act_main, act_high, w_main, w_high),
-                        M, N, K, warmup=5, repeat=20)
+                        lambda: gemm_b3_grouped(prep), M, N, K, warmup=5, repeat=50)
                 else:
-                    y = gemm_cutlass_int8(act_main, act_high, w_main, w_high)
+                    y = gemm_b3_per_token(prep)
                     perf = compute_perf_metrics(
-                        lambda: gemm_cutlass_int8(act_main, act_high, w_main, w_high),
-                        M, N, K, warmup=10, repeat=100)
+                        lambda: gemm_b3_per_token(prep), M, N, K, warmup=10, repeat=100)
 
             else:
                 continue
@@ -636,7 +601,11 @@ def bench_single_layer(layer_dir, bs_key):
         'weight_int8_mb': W_fp16.numel() * 1 / 1e6,
         'weight_int4_mb': W_fp16.numel() * 0.5 / 1e6,
     }
-    results['_meta'] = {'M': M, 'N': N, 'K': K, 'layer': meta.get('name', '')}
+    results['_meta'] = {
+        'M': M, 'N': N, 'K': K,
+        'layer': meta.get('name', ''),
+        'grouped': grouped,
+    }
 
     return results
 
@@ -648,7 +617,8 @@ def bench_single_layer(layer_dir, bs_key):
 def print_results_table(layer_name, results, bs_key):
     meta = results.get('_meta', {})
     M, N, K = meta.get('M', '?'), meta.get('N', '?'), meta.get('K', '?')
-    print(f"\nLayer: {meta.get('layer', layer_name)} (M={M}, N={N}, K={K}) [{bs_key}]")
+    tag = ' [grouped]' if meta.get('grouped') else ''
+    print(f"\nLayer: {meta.get('layer', layer_name)} (M={M}, N={N}, K={K}) [{bs_key}]{tag}")
     print("=" * 120)
 
     header = f"{'Test':<20} {'MaxAbsErr':>10} {'MAE':>10} {'RMSE':>10} {'CosSim':>10} {'SNR(dB)':>8} {'Lat(ms)':>8} {'TFLOPS':>8} {'vs FP16':>8}"
