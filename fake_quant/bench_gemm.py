@@ -16,8 +16,13 @@ import time
 import torch
 import torch.nn.functional as F
 
-# Triton and CUTLASS GEMM kernels removed — baseline uses fp32 simulation only.
-# Real INT TC kernels will be added later as separate baselines.
+# CUTLASS INT8 TC kernel
+try:
+    import resq_gemm_v2
+    HAS_CUTLASS = True
+except ImportError:
+    HAS_CUTLASS = False
+    print("WARNING: resq_gemm_v2 not available — CUTLASS INT8 tests will be skipped")
 
 
 # ============================================================
@@ -284,15 +289,86 @@ def gemm_real_quant(act_quant_main, act_quant_high,
 
         return y.half().reshape(batch, seq, N)
 
+def gemm_cutlass_int8(act_quant_main, act_quant_high,
+                      weight_int_main, weight_int_high):
+    """Baseline 3: CUTLASS INT8 TC GEMM with Python-side scale/bias.
+
+    Per-token only. Two CUTLASS kernel launches (main + high),
+    scale/bias/shift handled in Python.
+    Uses real INT8 Tensor Core with INT32 accumulation.
+    """
+    if not HAS_CUTLASS:
+        raise RuntimeError("resq_gemm_v2 not available")
+
+    q_w_m = weight_int_main['q_int'].cuda()   # (N, K_m) int values as float/int
+    s_w_m = weight_int_main['scale'].cuda().float()
+
+    q_w_h = weight_int_high['q_int'].cuda() if weight_int_high else None
+    s_w_h = weight_int_high['scale'].cuda().float() if weight_int_high else None
+
+    # Activation data
+    q_x_m_raw = act_quant_main['q_int'].cuda()
+    s_x_m = act_quant_main['scale'].cuda().float()
+    z_x_m = act_quant_main.get('zero', None)
+    if z_x_m is not None:
+        z_x_m = z_x_m.cuda().float()
+    else:
+        z_x_m = torch.zeros_like(q_x_m_raw[..., :1]).float()
+
+    N = q_w_m.shape[0]
+    s_x_tok = _extract_per_token_scale(s_x_m).reshape(-1, 1)
+    z_x_tok = _extract_per_token_scale(z_x_m).reshape(-1, 1) if z_x_m.shape[-1] > 1 else z_x_m.reshape(-1, 1)
+    q_x_flat = q_x_m_raw.reshape(-1, q_x_m_raw.shape[-1])
+    M = q_x_flat.shape[0]
+
+    # === Main group: shift-8, CUTLASS INT8 TC ===
+    q_x_m_shifted = (q_x_flat.float() - 8.0).to(torch.int8)   # [-8,7] fits int8
+    q_w_m_int8 = q_w_m.to(torch.int8)                           # already [-8,7]
+    # Ensure contiguous for CUTLASS
+    q_x_m_shifted = q_x_m_shifted.contiguous()
+    q_w_m_int8 = q_w_m_int8.contiguous()
+
+    D_m = resq_gemm_v2.gemm_s8s8(q_x_m_shifted, q_w_m_int8)   # (M, N) float32
+    # Bias: (8 - zero) * colsum(q_w)
+    w_colsum_m = q_w_m_int8.float().sum(dim=1, keepdim=True).T  # (1, N)
+    bias_m = (8.0 - z_x_tok) @ w_colsum_m                       # (M, N)
+    Y_m = s_x_tok * s_w_m.flatten().unsqueeze(0) * (D_m + bias_m)
+
+    # === High group: shift-128, CUTLASS INT8 TC ===
+    Y_h = torch.zeros(M, N, device='cuda', dtype=torch.float32)
+    if act_quant_high is not None and q_w_h is not None:
+        q_x_h_raw = act_quant_high['q_int'].cuda()
+        s_x_h = act_quant_high['scale'].cuda().float()
+        z_x_h = act_quant_high.get('zero', None)
+        if z_x_h is not None:
+            z_x_h = z_x_h.cuda().float()
+        else:
+            z_x_h = torch.zeros_like(q_x_h_raw[..., :1]).float()
+
+        s_x_h_tok = _extract_per_token_scale(s_x_h).reshape(-1, 1)
+        z_x_h_tok = _extract_per_token_scale(z_x_h).reshape(-1, 1) if z_x_h.shape[-1] > 1 else z_x_h.reshape(-1, 1)
+        q_x_h_flat = q_x_h_raw.reshape(-1, q_x_h_raw.shape[-1])
+
+        q_x_h_shifted = (q_x_h_flat.float() - 128.0).to(torch.int8)  # [-128,127]
+        q_w_h_int8 = q_w_h.to(torch.int8)
+        q_x_h_shifted = q_x_h_shifted.contiguous()
+        q_w_h_int8 = q_w_h_int8.contiguous()
+
+        D_h = resq_gemm_v2.gemm_s8s8(q_x_h_shifted, q_w_h_int8)
+        w_colsum_h = q_w_h_int8.float().sum(dim=1, keepdim=True).T
+        bias_h = (128.0 - z_x_h_tok) @ w_colsum_h
+        Y_h = s_x_h_tok * s_w_h.flatten().unsqueeze(0) * (D_h + bias_h)
+
+    y = (Y_m + Y_h).half()
+    return y
 
 
-# ============================================================
-# Test definitions
-# ============================================================
+
 
 ALL_TESTS = [
     ('FP16 baseline', 'fp16'),
     ('Real (fp32 acc)', 'real_fp32'),
+    ('CUTLASS INT8 TC', 'cutlass_int8'),
 ]
 
 
@@ -394,6 +470,27 @@ def bench_single_layer(layer_dir, bs_key):
                 perf = compute_perf_metrics(
                     lambda: gemm_real_quant(act_main, act_high, w_main, w_high),
                     M, N, K, warmup=5, repeat=20)
+
+            elif test_key == 'cutlass_int8':
+                if not HAS_CUTLASS:
+                    result['error'] = 'resq_gemm_v2 not available'
+                    results[test_name] = result
+                    continue
+                if act_main is None or w_main is None:
+                    result['error'] = 'missing quant data'
+                    results[test_name] = result
+                    continue
+                # Per-token only (skip grouped/o_proj for now)
+                s_x_test = act_main['scale'].cuda().float()
+                if s_x_test.dim() > 3:
+                    result['error'] = 'grouped (o_proj) not supported yet'
+                    results[test_name] = result
+                    continue
+
+                y = gemm_cutlass_int8(act_main, act_high, w_main, w_high)
+                perf = compute_perf_metrics(
+                    lambda: gemm_cutlass_int8(act_main, act_high, w_main, w_high),
+                    M, N, K, warmup=10, repeat=100)
 
             else:
                 continue
