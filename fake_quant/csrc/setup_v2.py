@@ -20,6 +20,7 @@ setup(
             name='resq_gemm_v2',
             sources=[
                 'resq_gemm/resq_gemm_v2.cu',
+                'resq_gemm/resq_gemm_grouped.cu',
                 'resq_gemm/resq_gemm_v2_binding.cpp',
             ],
             include_dirs=cutlass_include_dirs,
