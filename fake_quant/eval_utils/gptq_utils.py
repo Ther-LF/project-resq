@@ -159,6 +159,11 @@ class GPTQ:
         H = self.H
         del self.H
         dead = torch.diag(H) == 0
+
+        # ResComp: compute xhat_x BEFORE dead/damp processing (matches original paper)
+        if self.rescomp:
+            xhat_x = (self.dXXT + H).clone()
+
         H[dead, dead] = 1
         W[:, dead] = 0
         if self.rescomp:
@@ -187,8 +192,6 @@ class GPTQ:
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
-        if self.rescomp:
-            H_damped = H.clone()  # save H after damping for ResComp
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
         try:
@@ -209,12 +212,12 @@ class GPTQ:
         if self.rescomp:
             if actorder:
                 self.dXXT = self.dXXT[perm][:, perm]
-            xhat_x = self.dXXT + H_damped
+                xhat_x = xhat_x[perm][:, perm]
             alpha = self.rescomp_alpha
             alpha2 = self.rescomp_alpha2
             P = alpha * ((self.dXXT @ Hinv.T).triu_(diagonal=1)) @ Hinv
             R = alpha2 * ((xhat_x @ Hinv.T).triu_(diagonal=1)) @ Hinv
-            del self.dXXT, H_damped
+            del self.dXXT, xhat_x
             # Mode: 'allw' for >=3 bit, 'org' for 2-bit
             rescomp_mode = 'org' if self.quantizer.bits == 2 else 'allw'
 
