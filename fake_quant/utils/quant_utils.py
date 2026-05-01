@@ -1122,3 +1122,21 @@ def find_qlayers(
             )
         )
     return res
+
+
+def disable_act_quant(module):
+    """Temporarily disable activation quantization on all ActQuantWrappers.
+    Returns a dict of {name: original_bits} to restore later."""
+    bits_config = {}
+    for name, m in module.named_modules():
+        if isinstance(m, ActQuantWrapper):
+            bits_config[name] = m.quantizer.bits
+            m.quantizer.bits = 16
+    return bits_config
+
+
+def enable_act_quant(module, bits_config):
+    """Restore activation quantization bits from a saved config."""
+    for name, m in module.named_modules():
+        if isinstance(m, ActQuantWrapper) and name in bits_config:
+            m.quantizer.bits = bits_config[name]

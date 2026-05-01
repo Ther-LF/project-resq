@@ -328,6 +328,26 @@ def parser_gen():
         help="Enable model parallelism using this flag. Map decoder blocks to different GPUs",
     )
 
+    # ResComp (residual compensation) arguments
+    parser.add_argument(
+        "--rescomp",
+        action="store_true",
+        default=False,
+        help="Use ResComp residual compensation in GPTQ weight quantization (ICLR'26)",
+    )
+    parser.add_argument(
+        "--rescomp_alpha",
+        type=float,
+        default=0.25,
+        help="ResComp compensation strength for P term (default: 0.25)",
+    )
+    parser.add_argument(
+        "--rescomp_alpha2",
+        type=float,
+        default=0.25,
+        help="ResComp compensation strength for R term (default: 0.25)",
+    )
+
     # GEMM data collection arguments
     parser.add_argument("--gemm_output_dir", type=str, default="./gemm_data",
                         help="Directory to save collected GEMM data")

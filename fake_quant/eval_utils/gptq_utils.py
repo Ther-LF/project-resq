@@ -83,11 +83,12 @@ class LWC_Layer(nn.Module):
 
 
 class GPTQ:
-    def __init__(self, layer, mixed_precision=False, high_bits_length=0, low_bits_length=0):
+    def __init__(self, layer, mixed_precision=False, high_bits_length=0, low_bits_length=0,
+                 rescomp=False):
         self.layer = layer
         self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
-        
+
         self.mixed_precision = mixed_precision  # mixed precision quantization
         self.high_bits_length = high_bits_length # high precision
         self.low_bits_length = low_bits_length # low precision
@@ -97,6 +98,12 @@ class GPTQ:
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 
+        # ResComp support
+        self.rescomp = rescomp
+        if rescomp:
+            self.dXXT = torch.zeros((self.columns, self.columns), device=self.dev)
+            self.fp_inp = []
+
     def add_batch(self, inp, out):
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
@@ -105,9 +112,15 @@ class GPTQ:
             inp = inp.reshape((-1, inp.shape[-1]))
         inp = inp.t()
         self.H *= self.nsamples / (self.nsamples + tmp)
+        if self.rescomp:
+            self.dXXT *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
+        if self.rescomp:
+            fp_inp_batch = self.fp_inp.pop(0)
+            dX = fp_inp_batch.float() * math.sqrt(2 / self.nsamples) - inp
+            self.dXXT += dX.matmul(inp.t())
 
     def fasterquant(
         self,
@@ -148,6 +161,9 @@ class GPTQ:
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
+        if self.rescomp:
+            self.dXXT[:, dead] = 0
+            W_org_copy = W.clone()
         if static_groups:
             assert not mp  # not supported/tested yet.
             groups = []
@@ -160,6 +176,8 @@ class GPTQ:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
             H = H[perm][:, perm]
+            if self.rescomp:
+                W_org_copy = W_org_copy[:, perm]
             invperm = torch.argsort(perm)
 
         Losses = torch.zeros_like(W)
@@ -169,6 +187,8 @@ class GPTQ:
         damp = percdamp * torch.mean(torch.diag(H))
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
+        if self.rescomp:
+            H_damped = H.clone()  # save H after damping for ResComp
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
         try:
@@ -184,9 +204,21 @@ class GPTQ:
                 print(f"Failed again after stabilization: {e}")
             
         Hinv = H
+
+        # ResComp: compute compensation matrices P and R
+        if self.rescomp:
+            if actorder:
+                self.dXXT = self.dXXT[perm][:, perm]
+            xhat_x = self.dXXT + H_damped
+            alpha = self.rescomp_alpha
+            alpha2 = self.rescomp_alpha2
+            P = alpha * ((self.dXXT @ Hinv.T).triu_(diagonal=1)) @ Hinv
+            R = alpha2 * ((xhat_x @ Hinv.T).triu_(diagonal=1)) @ Hinv
+            del self.dXXT, H_damped
+            # Mode: 'allw' for >=3 bit, 'org' for 2-bit
+            rescomp_mode = 'org' if self.quantizer.bits == 2 else 'allw'
+
         for i1 in range(0, self.columns, blocksize):
-            # i1 = 0
-            # while i1 < self.columns:
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
 
@@ -195,6 +227,12 @@ class GPTQ:
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
+
+            if self.rescomp:
+                P1 = P[i1:i2, i1:i2]
+                R1 = R[i1:i2, i1:i2]
+                W_org1 = W_org_copy[:, i1:i2].clone()
+
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
@@ -230,16 +268,43 @@ class GPTQ:
 
                 err1 = (w - q) / d
                 W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+
+                # ResComp: additional compensation terms
+                if self.rescomp:
+                    if rescomp_mode == 'org':
+                        W1[:, i:] += w.unsqueeze(1).matmul(P1[i, i:].unsqueeze(0))
+                        W1[:, i:] += (W_org1[:, i] - w).unsqueeze(1).matmul(R1[i, i:].unsqueeze(0))
+                    else:  # 'allw'
+                        W1[:, i+1:] += w.unsqueeze(1).matmul(P1[i, i+1:].unsqueeze(0))
+                        W1[:, i+1:] += (W_org1[:, i] - w).unsqueeze(1).matmul(R1[i, i+1:].unsqueeze(0))
+
                 Err1[:, i] = err1
 
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-            # if i1 < low_dim and i1 + blocksize > low_dim:
-            #     i1 += low_dim
-            # else:
-            #     i1 += blocksize
+
+            # ResComp: inter-block compensation
+            if self.rescomp:
+                if rescomp_mode == 'org':
+                    W[:, i2:] += W1.matmul(P[i1:i2, i2:])
+                    W[:, i2:] += (W_org1 - W1).matmul(R[i1:i2, i2:])
+                else:  # 'allw' — clamp W1 to quantizable range
+                    # Get clamp bounds from the quantizer
+                    if self.quantizer.sym:
+                        scale = self.quantizer.scale.squeeze()
+                        q_max = self.quantizer.maxq
+                        fq_max = (q_max * scale).unsqueeze(1)
+                        fq_min = (-(q_max + 1) * scale).unsqueeze(1)
+                    else:
+                        scale = self.quantizer.scale.squeeze()
+                        zero = self.quantizer.zero.squeeze()
+                        fq_max = ((self.quantizer.maxq - zero) * scale).unsqueeze(1)
+                        fq_min = ((0 - zero) * scale).unsqueeze(1)
+                    W1_clamped = W1.clamp(min=fq_min, max=fq_max)
+                    W[:, i2:] += W1_clamped.matmul(P[i1:i2, i2:])
+                    W[:, i2:] += (W_org1 - W1_clamped).matmul(R[i1:i2, i2:])
 
         torch.cuda.synchronize()
 
@@ -266,6 +331,9 @@ class GPTQ:
         self.H = None
         self.Losses = None
         self.Trace = None
+        if self.rescomp:
+            self.dXXT = None
+            self.fp_inp = None
         torch.cuda.empty_cache()
         utils.cleanup_memory(verbos=False)
 
@@ -276,6 +344,10 @@ def gptq_fwrd(model, dataloader, dev, args):
     From GPTQ repo
     """
     logging.info("-----GPTQ Quantization-----")
+    use_rescomp = getattr(args, 'rescomp', False)
+    if use_rescomp:
+        logging.info("ResComp mode enabled (alpha=%.2f, alpha2=%.2f)",
+                     args.rescomp_alpha, args.rescomp_alpha2)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -393,7 +465,11 @@ def gptq_fwrd(model, dataloader, dev, args):
                     mixed_precision=mixed_precision,
                     high_bits_length=high_bits_length,
                     low_bits_length=low_bits_length,
+                    rescomp=use_rescomp,
                 )
+                if use_rescomp:
+                    gptq[name].rescomp_alpha = args.rescomp_alpha
+                    gptq[name].rescomp_alpha2 = args.rescomp_alpha2
                 gptq[name].quantizer = quant_utils.WeightQuantizer()
                 gptq[name].quantizer.configure(
                     layer_weight_bits,
@@ -417,6 +493,35 @@ def gptq_fwrd(model, dataloader, dev, args):
                         sym=False,
                         mse=args.w_clip,
                     )
+
+            # ResComp: collect FP (full-precision) inputs with activation quant disabled
+            if use_rescomp:
+                from utils import quant_utils as qu
+                bits_config = qu.disable_act_quant(layer)
+                fp_cache = {name: [] for name in subset}
+
+                def make_fp_hook(name):
+                    def hook_fn(_, inp, out):
+                        fp_cache[name].append(inp[0].data.reshape(-1, inp[0].shape[-1]).t().clone())
+                    return hook_fn
+
+                fp_handles = []
+                for name in subset:
+                    fp_handles.append(subset[name].register_forward_hook(make_fp_hook(name)))
+                for j in range(args.nsamples):
+                    layer(
+                        inps[j].unsqueeze(0),
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                    )
+                for h in fp_handles:
+                    h.remove()
+                qu.enable_act_quant(layer, bits_config)
+
+                # Store fp_inp lists in gptq objects
+                for name in subset:
+                    gptq[name].fp_inp = fp_cache[name]
 
             def add_batch(name):
                 def tmp(_, inp, out):

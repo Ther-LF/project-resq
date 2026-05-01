@@ -1,5 +1,5 @@
-# W4A4KV4 evaluation with GPTQ weight quantization
-# This is the full ResQ paper configuration
+# W4A4KV4 evaluation with ResComp weight quantization
+# Compare against 3_eval_w4a4.sh (standard GPTQ) to see ResComp improvement
 
 torchrun --nnodes=1 --nproc_per_node=1 --master_port=24544 ptq.py \
 --input_model unsloth/Llama-3.2-1B-Instruct \
@@ -26,5 +26,7 @@ torchrun --nnodes=1 --nproc_per_node=1 --master_port=24544 ptq.py \
 --optimized_basis_path ./rotation/U-wikitext-512-Llama-3.2-1B.bin \
 --rotation_granularity 'full_shared' \
 --rotate \
---tasks "mmlu,boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa" \
---save_qmodel_path ./qmodels/W4A4KV4-Llama-3.2-1B.pt
+--rescomp \
+--rescomp_alpha 0.25 \
+--rescomp_alpha2 0.25 \
+--tasks "mmlu,boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
