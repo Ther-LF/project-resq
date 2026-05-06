@@ -424,10 +424,43 @@ def gptq_fwrd(model, dataloader, dev, args):
     high_fraction = args.high_fraction
     low_fraction = args.low_fraction
 
+    # ResComp: maintain a separate FP activation stream
+    if use_rescomp:
+        fp_inps = inps.clone()
+
     for i in range(len(layers)):
         print(f"\nLayer {i}:", flush=True, end=" ")
         layer = layers[i].to(dev)
         full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
+
+        # ResComp: forward fp_inps through the layer with ORIGINAL weights
+        # and collect FP inputs for ALL linear layers in one pass
+        if use_rescomp:
+            from utils import quant_utils as qu
+            bits_config = qu.disable_act_quant(layer)
+            rescomp_fp_cache = {}
+
+            def make_fp_hook_layer(name):
+                def hook_fn(_, inp, out):
+                    if name not in rescomp_fp_cache:
+                        rescomp_fp_cache[name] = []
+                    rescomp_fp_cache[name].append(inp[0].data.reshape(-1, inp[0].shape[-1]).t().clone())
+                return hook_fn
+
+            fp_handles = []
+            for name in full:
+                fp_handles.append(full[name].register_forward_hook(make_fp_hook_layer(name)))
+            for j in range(args.nsamples):
+                fp_inps[j] = layer(
+                    fp_inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                )[0]
+            for h in fp_handles:
+                h.remove()
+            qu.enable_act_quant(layer, bits_config)
+
         for names in sequential:
             subset = {n: full[n] for n in names if n in full.keys()}
             gptq = {}
@@ -497,34 +530,11 @@ def gptq_fwrd(model, dataloader, dev, args):
                         mse=args.w_clip,
                     )
 
-            # ResComp: collect FP (full-precision) inputs with activation quant disabled
+            # ResComp: assign pre-collected FP inputs to gptq objects
             if use_rescomp:
-                from utils import quant_utils as qu
-                bits_config = qu.disable_act_quant(layer)
-                fp_cache = {name: [] for name in subset}
-
-                def make_fp_hook(name):
-                    def hook_fn(_, inp, out):
-                        fp_cache[name].append(inp[0].data.reshape(-1, inp[0].shape[-1]).t().clone())
-                    return hook_fn
-
-                fp_handles = []
                 for name in subset:
-                    fp_handles.append(subset[name].register_forward_hook(make_fp_hook(name)))
-                for j in range(args.nsamples):
-                    layer(
-                        inps[j].unsqueeze(0),
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                    )
-                for h in fp_handles:
-                    h.remove()
-                qu.enable_act_quant(layer, bits_config)
-
-                # Store fp_inp lists in gptq objects
-                for name in subset:
-                    gptq[name].fp_inp = fp_cache[name]
+                    if name in rescomp_fp_cache:
+                        gptq[name].fp_inp = rescomp_fp_cache[name]
 
             def add_batch(name):
                 def tmp(_, inp, out):
