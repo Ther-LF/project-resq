@@ -282,27 +282,27 @@ class GEMMDataCollector:
                 with torch.no_grad():
                     self.model(input_ids)
 
-            # After forward: grab _last_quant from each wrapper (set by forward_real_quant)
+            # After forward: save _last_quant directly to disk for each wrapper
+            # (must be done immediately, before next bs iteration overwrites _last_quant)
             bs_key = f"bs{bs}"
             for name, wrapper in self.wrappers.items():
-                if hasattr(wrapper, '_last_quant') and name in self._capture_data:
-                    if bs_key in self._capture_data[name]:
-                        lq = wrapper._last_quant
-                        act_quant = {}
-                        act_quant['main'] = {
-                            'q_int': lq['q_m'].cpu().short(),
-                            'scale': lq['s_x_m'].cpu().half() if torch.is_tensor(lq['s_x_m']) else None,
-                            'zero': lq['z_x_m'].cpu().half() if torch.is_tensor(lq['z_x_m']) else None,
+                if hasattr(wrapper, '_last_quant'):
+                    layer_dir = os.path.join(self.output_dir, sanitize_layer_name(name))
+                    os.makedirs(layer_dir, exist_ok=True)
+                    lq = wrapper._last_quant
+                    main_data = {
+                        'q_int': lq['q_m'].cpu().short(),
+                        'scale': lq['s_x_m'].cpu().half() if torch.is_tensor(lq['s_x_m']) else None,
+                        'zero': lq['z_x_m'].cpu().half() if torch.is_tensor(lq['z_x_m']) else None,
+                    }
+                    torch.save(main_data, os.path.join(layer_dir, f'act_quant_main_{bs_key}.pt'))
+                    if lq['q_h'] is not None:
+                        high_data = {
+                            'q_int': lq['q_h'].cpu().short(),
+                            'scale': lq['s_x_h'].cpu().half() if torch.is_tensor(lq['s_x_h']) else None,
+                            'zero': lq['z_x_h'].cpu().half() if torch.is_tensor(lq['z_x_h']) else None,
                         }
-                        if lq['q_h'] is not None:
-                            act_quant['high'] = {
-                                'q_int': lq['q_h'].cpu().short(),
-                                'scale': lq['s_x_h'].cpu().half() if torch.is_tensor(lq['s_x_h']) else None,
-                                'zero': lq['z_x_h'].cpu().half() if torch.is_tensor(lq['z_x_h']) else None,
-                            }
-                        self._capture_data[name][bs_key]['act_quant'] = act_quant
-                        # Also save real quant output
-                        # (output hook may not have triggered, so grab from actual output)
+                        torch.save(high_data, os.path.join(layer_dir, f'act_quant_high_{bs_key}.pt'))
 
             self._remove_hooks()
             self._remove_output_hooks()
@@ -374,7 +374,8 @@ class GEMMDataCollector:
                         torch.save(data['input_fp16'],
                                    os.path.join(layer_dir, f'input_fp16_{bs_key}.pt'))
 
-                    # Activation quant data
+                    # Activation quant data (already saved directly after forward)
+                    # Just check if files exist, skip if already written
                     if 'act_quant' in data:
                         for group_name, group_data in data['act_quant'].items():
                             torch.save(group_data,
