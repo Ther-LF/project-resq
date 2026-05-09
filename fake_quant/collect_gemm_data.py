@@ -214,8 +214,10 @@ class GEMMDataCollector:
                 def hook_fn(module, args, output):
                     bs_key = f"bs{self._current_bs}"
                     if layer_name in self._capture_data and bs_key in self._capture_data[layer_name]:
-                        # Determine if this is fake or real quant based on forward method
-                        if hasattr(module, '_real_quant_ready') and module._real_quant_ready and module.forward == module.forward_real_quant:
+                        # Determine if this is real quant based on readiness flag
+                        # NOTE: comparing bound methods (module.forward == module.forward_real_quant)
+                        # is unreliable because bound method objects are recreated on access.
+                        if hasattr(module, '_real_quant_ready') and module._real_quant_ready:
                             self._capture_data[layer_name][bs_key]['output_real_quant'] = output.cpu().half()
                             # Grab quantized activation from _last_quant (computed inside forward_real_quant)
                             if hasattr(module, '_last_quant'):
