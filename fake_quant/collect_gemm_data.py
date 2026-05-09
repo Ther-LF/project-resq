@@ -167,7 +167,9 @@ class GEMMDataCollector:
         self.hooks = []
 
     def _make_hook(self, name, wrapper):
-        """Create a pre-forward hook that captures input, then we also need output."""
+        """Create a pre-forward hook that captures input for FP16 baseline only.
+        Activation quantization data is captured from _last_quant (set by forward_real_quant).
+        """
         collector = self
 
         def hook_fn(module, args):
@@ -179,8 +181,6 @@ class GEMMDataCollector:
             # Compute FP16 baseline: use column_order if present (o_proj)
             # Weight W is already rearranged by rearrange_columns(),
             # so we reorder x to match for the FP16 baseline matmul only.
-            # Activation quantization stays in the original (un-reordered) space
-            # because forward() quantizes BEFORE applying column_order.
             col_order = getattr(wrapper, '_column_order', None)
             if col_order is not None:
                 x_for_baseline = x_rotated[..., col_order]
@@ -193,52 +193,51 @@ class GEMMDataCollector:
             output_fp16_baseline = (x_flat.float() @ W.float().T).half()
             output_fp16_baseline = output_fp16_baseline.reshape(*x_rotated.shape[:-1], -1)
 
-            # Compute activation quantization params (in original un-reordered space)
-            wrapper.quantizer.find_params(x_rotated)
-
-            # Handle groupsize reshaping for quantize
-            x_for_quant = x_rotated
-            if wrapper.quantizer.groupsize > 0:
-                init_shape = x_for_quant.shape
-                x_for_quant = x_for_quant.reshape(
-                    x_for_quant.shape[0], x_for_quant.shape[1],
-                    x_for_quant.shape[2] // wrapper.quantizer.groupsize,
-                    wrapper.quantizer.groupsize
-                )
-
-            act_quant = quantize_activation(x_for_quant, wrapper.quantizer)
-            wrapper.quantizer.free()
-
-            # Store captured data
+            # Store partial data (activation quant will be grabbed from _last_quant after forward)
             bs_key = f"bs{collector._current_bs}"
             if name not in collector._capture_data:
                 collector._capture_data[name] = {}
 
             collector._capture_data[name][bs_key] = {
                 'input_fp16': x_rotated.cpu().half(),
-                'act_quant': act_quant,
                 'output_fp16_baseline': output_fp16_baseline.cpu().half(),
             }
 
         return hook_fn
 
     def _install_output_hooks(self, batch_size):
-        """Install output hooks (post-forward) to capture fake/real quant outputs."""
+        """Install output hooks (post-forward) to capture fake/real quant outputs + activation quant data."""
         self._output_hooks = []
 
         for name, wrapper in self.wrappers.items():
-            def make_output_hook(layer_name):
+            def make_output_hook(layer_name, wrap):
                 def hook_fn(module, args, output):
                     bs_key = f"bs{self._current_bs}"
                     if layer_name in self._capture_data and bs_key in self._capture_data[layer_name]:
                         # Determine if this is fake or real quant based on forward method
                         if hasattr(module, '_real_quant_ready') and module._real_quant_ready and module.forward == module.forward_real_quant:
                             self._capture_data[layer_name][bs_key]['output_real_quant'] = output.cpu().half()
+                            # Grab quantized activation from _last_quant (computed inside forward_real_quant)
+                            if hasattr(module, '_last_quant'):
+                                lq = module._last_quant
+                                act_quant = {}
+                                act_quant['main'] = {
+                                    'q_int': lq['q_m'].cpu().short(),
+                                    'scale': lq['s_x_m'].cpu().half() if torch.is_tensor(lq['s_x_m']) else None,
+                                    'zero': lq['z_x_m'].cpu().half() if torch.is_tensor(lq['z_x_m']) else None,
+                                }
+                                if lq['q_h'] is not None:
+                                    act_quant['high'] = {
+                                        'q_int': lq['q_h'].cpu().short(),
+                                        'scale': lq['s_x_h'].cpu().half() if torch.is_tensor(lq['s_x_h']) else None,
+                                        'zero': lq['z_x_h'].cpu().half() if torch.is_tensor(lq['z_x_h']) else None,
+                                    }
+                                self._capture_data[layer_name][bs_key]['act_quant'] = act_quant
                         else:
                             self._capture_data[layer_name][bs_key]['output_fake_quant'] = output.cpu().half()
                 return hook_fn
 
-            handle = wrapper.register_forward_hook(make_output_hook(name))
+            handle = wrapper.register_forward_hook(make_output_hook(name, wrapper))
             self._output_hooks.append(handle)
 
     def _remove_output_hooks(self):

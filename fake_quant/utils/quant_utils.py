@@ -727,6 +727,7 @@ class ActQuantWrapper(torch.nn.Module):
 
         # 3. Reshape for groupsize if needed
         grouped = (quantizer.groupsize > 0)
+        x_before_group = x  # save for collection
         if grouped:
             init_shape = x.shape  # (batch, seq, K)
             x = x.reshape(x.shape[0], x.shape[1],
@@ -764,6 +765,17 @@ class ActQuantWrapper(torch.nn.Module):
                 shift_h = float(quantizer.maxq_h + 1) / 2.0  # 128 for 8-bit
 
         self.quantizer.free()
+
+        # Save quantized activation for external collection (collect_gemm_data.py)
+        self._last_quant = {
+            'q_m': q_m.detach(), 's_x_m': s_x_m.detach() if torch.is_tensor(s_x_m) else s_x_m,
+            'z_x_m': z_x_m.detach() if torch.is_tensor(z_x_m) else z_x_m,
+            'q_h': q_h.detach() if q_h is not None else None,
+            's_x_h': s_x_h.detach() if s_x_h is not None and torch.is_tensor(s_x_h) else s_x_h,
+            'z_x_h': z_x_h.detach() if z_x_h is not None and torch.is_tensor(z_x_h) else z_x_h,
+            'x_rotated': x_before_group.detach() if grouped else x.detach(),
+            'grouped': grouped,
+        }
 
         # 5. INT GEMM via shift+bias formula
         # Weight integers are already stored centered (e.g. [-8,7] for main, [-128,127] for high)
