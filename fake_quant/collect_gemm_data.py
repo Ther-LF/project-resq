@@ -282,6 +282,28 @@ class GEMMDataCollector:
                 with torch.no_grad():
                     self.model(input_ids)
 
+            # After forward: grab _last_quant from each wrapper (set by forward_real_quant)
+            bs_key = f"bs{bs}"
+            for name, wrapper in self.wrappers.items():
+                if hasattr(wrapper, '_last_quant') and name in self._capture_data:
+                    if bs_key in self._capture_data[name]:
+                        lq = wrapper._last_quant
+                        act_quant = {}
+                        act_quant['main'] = {
+                            'q_int': lq['q_m'].cpu().short(),
+                            'scale': lq['s_x_m'].cpu().half() if torch.is_tensor(lq['s_x_m']) else None,
+                            'zero': lq['z_x_m'].cpu().half() if torch.is_tensor(lq['z_x_m']) else None,
+                        }
+                        if lq['q_h'] is not None:
+                            act_quant['high'] = {
+                                'q_int': lq['q_h'].cpu().short(),
+                                'scale': lq['s_x_h'].cpu().half() if torch.is_tensor(lq['s_x_h']) else None,
+                                'zero': lq['z_x_h'].cpu().half() if torch.is_tensor(lq['z_x_h']) else None,
+                            }
+                        self._capture_data[name][bs_key]['act_quant'] = act_quant
+                        # Also save real quant output
+                        # (output hook may not have triggered, so grab from actual output)
+
             self._remove_hooks()
             self._remove_output_hooks()
 

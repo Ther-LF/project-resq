@@ -777,6 +777,11 @@ class ActQuantWrapper(torch.nn.Module):
             'grouped': grouped,
         }
 
+        # Also store in global registry for collect_gemm_data.py to pick up
+        if not hasattr(ActQuantWrapper, '_quant_registry'):
+            ActQuantWrapper._quant_registry = {}
+        ActQuantWrapper._quant_registry[id(self)] = self._last_quant
+
         # 5. INT GEMM via shift+bias formula
         # Weight integers are already stored centered (e.g. [-8,7] for main, [-128,127] for high)
         q_w_m = self.W_m_int.float()  # (N, K_m), centered
