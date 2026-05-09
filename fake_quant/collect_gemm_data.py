@@ -515,6 +515,8 @@ def main():
                 if bs_key in collector.collected.get(layer_name, {}):
                     if 'output_real_quant' in data:
                         collector.collected[layer_name][bs_key]['output_real_quant'] = data['output_real_quant']
+                    if 'act_quant' in data:
+                        collector.collected[layer_name][bs_key]['act_quant'] = data['act_quant']
 
     # Save everything
     collector.save_all()
