@@ -282,13 +282,14 @@ class GEMMDataCollector:
                 with torch.no_grad():
                     self.model(input_ids)
 
-            # After forward: save _last_quant directly to disk for each wrapper
-            # (must be done immediately, before next bs iteration overwrites _last_quant)
+            # After forward: save _last_quant and _last_gemm_output directly to disk
+            # (must be done immediately, before next bs iteration overwrites them)
             bs_key = f"bs{bs}"
             for name, wrapper in self.wrappers.items():
+                layer_dir = os.path.join(self.output_dir, sanitize_layer_name(name))
+                os.makedirs(layer_dir, exist_ok=True)
+
                 if hasattr(wrapper, '_last_quant'):
-                    layer_dir = os.path.join(self.output_dir, sanitize_layer_name(name))
-                    os.makedirs(layer_dir, exist_ok=True)
                     lq = wrapper._last_quant
                     main_data = {
                         'q_int': lq['q_m'].cpu().short(),
@@ -303,6 +304,10 @@ class GEMMDataCollector:
                             'zero': lq['z_x_h'].cpu().half() if torch.is_tensor(lq['z_x_h']) else None,
                         }
                         torch.save(high_data, os.path.join(layer_dir, f'act_quant_high_{bs_key}.pt'))
+
+                if hasattr(wrapper, '_last_gemm_output'):
+                    torch.save(wrapper._last_gemm_output.cpu().half(),
+                               os.path.join(layer_dir, f'output_gemm_only_{bs_key}.pt'))
 
             self._remove_hooks()
             self._remove_output_hooks()
