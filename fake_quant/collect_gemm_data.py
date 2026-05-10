@@ -391,6 +391,9 @@ class GEMMDataCollector:
                     if 'output_real_quant' in data:
                         torch.save(data['output_real_quant'],
                                    os.path.join(layer_dir, f'output_real_quant_{bs_key}.pt'))
+                    if 'output_gemm_only' in data:
+                        torch.save(data['output_gemm_only'],
+                                   os.path.join(layer_dir, f'output_gemm_only_{bs_key}.pt'))
 
         print(f"\nData saved to {self.output_dir}")
         # Print summary
@@ -517,6 +520,15 @@ def main():
                         collector.collected[layer_name][bs_key]['output_real_quant'] = data['output_real_quant']
                     if 'act_quant' in data:
                         collector.collected[layer_name][bs_key]['act_quant'] = data['act_quant']
+
+        # Grab GEMM-only output (pre output-quant) from wrappers
+        # _last_gemm_output is the GEMM result BEFORE out_quantizer is applied
+        for name, wrapper in collector_real.wrappers.items():
+            if hasattr(wrapper, '_last_gemm_output'):
+                for bs in batch_sizes:
+                    bs_key = f"bs{bs}"
+                    if name in collector.collected and bs_key in collector.collected[name]:
+                        collector.collected[name][bs_key]['output_gemm_only'] = wrapper._last_gemm_output.cpu().half()
 
     # Save everything
     collector.save_all()

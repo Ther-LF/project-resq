@@ -885,6 +885,9 @@ class ActQuantWrapper(torch.nn.Module):
 
         y = y.to(x_dtype)
 
+        # Save GEMM output BEFORE output quantization (for kernel verification)
+        self._last_gemm_output = y.detach()
+
         # 6. Output quantization (if needed)
         if self.out_quantizer.bits < 16:
             self.out_quantizer.find_params(y)
