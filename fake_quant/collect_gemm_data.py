@@ -306,8 +306,13 @@ class GEMMDataCollector:
                         torch.save(high_data, os.path.join(layer_dir, f'act_quant_high_{bs_key}.pt'))
 
                 if hasattr(wrapper, '_last_gemm_output'):
-                    torch.save(wrapper._last_gemm_output.cpu().half(),
-                               os.path.join(layer_dir, f'output_gemm_only_{bs_key}.pt'))
+                    gemm_out = wrapper._last_gemm_output
+                    # Verify shape matches current batch size (guard against stale data)
+                    if gemm_out.shape[0] == bs:
+                        torch.save(gemm_out.cpu().half(),
+                                   os.path.join(layer_dir, f'output_gemm_only_{bs_key}.pt'))
+                    # Clear to prevent stale data leaking into next bs iteration
+                    del wrapper._last_gemm_output
 
             self._remove_hooks()
             self._remove_output_hooks()
